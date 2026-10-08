@@ -85,12 +85,63 @@ Overlay with the same input bytes.
 | `asyncBase` | An ordinary asynchronous B/W refresh can supply the base. Dedicated X3 grayscale-base waveforms do not qualify. |
 | `stagingWhileBusy` | Strip uploads and `prepareGrayscaleTarget()` stage host data without SPI access while a B/W waveform is pending. This does not authorize arbitrary display calls while BUSY. |
 
-The facade reports no grayscale while inverted or without a driver. A pending
+The facade reports no grayscale without a driver. Inverted grayscale requires
+the driver's explicit `supportsInvertedGrayscale(mode)` opt-in; all other
+drivers retain B/W output while inverted. A pending
 inversion transition disables `asyncBase`. CrossPoint's renderer additionally
 disables `asyncBase` when its fading fix is active. Re-query after changing
 controller or inversion settings; the descriptor is a snapshot, not an object
 to cache for the display's lifetime. Support describes the implemented path,
 not a guarantee that later buffer allocations cannot fail.
+
+## Inverted native text AA on X4 Pro UC8279 LUT68
+
+The exact X4 Pro UC8279 variant `0x68`, using its default 800×480 configuration
+and an allocated driver baseline buffer, supports inverted `Overlay`. Other
+variants, controllers and custom panel configurations remain B/W in inverted
+mode. `Absolute`, `Direct`, custom-LUT and factory/image-quality requests are
+not supported while inverted. Full-plane uploads are required; no async base,
+strip uploads or controller-RAM staging while busy is advertised.
+
+Host pixels and masks remain logical: B/W `B` has one for logical white; gray
+LSB/MSB masks retain the ordinary Overlay encoding. The blocking B/W facade
+temporarily complements pixels for the driver, then restores host memory.
+With that physical snapshot `C = ~B`, the driver computes
+`Q0 = C & ~LSB`, `Q1 = Q0 ^ MSB`, and retains the vendor's complement-on-wire
+convention. The two controller planes are restored to physical B/W
+`C = Q0 | Q1`; cleanup accepts the logical B/W baseline and complements it only
+on upload. No additional framebuffer is allocated.
+
+The inverse native LUT complements the selector-row address (WW↔BB, BW↔WB)
+and reverses each source phase's positive/negative rail selector. VCOM, neutral
+and floating phases, frame counts, repeats, voltages, temperature settings and
+gate padding remain unchanged. For native68 this changes only the intermediate
+rows' phase byte `0x83` to `0x43`; the endpoint rows are byte-identical. This is
+a symbolic polarity reversal of the existing waveform, **not measured optical
+calibration**. The original intermediate rows `0x22` and `0x23` are identical,
+and remain identical here. Four input coverage values therefore do not imply
+four distinct optical gray tones. The existing native-AA limitation is also
+documented in [inx-pro's text/image waveform policy](https://github.com/obijuankenobiii/inx-pro/blob/8811b04cf908965aed69e9fbc987a675d9156dfd/lib/hal_x4pro/HalDisplay.cpp#L374-L389).
+
+Inverted page changes use the existing OTP B/W refresh with an all-pixel re-drive
+after gray; they bypass the light-mode `prebw` waveform. The separate gray
+activation remains, so this feature does not eliminate B/W-to-gray page-turn
+pop-in. A periodic/full refresh retains its existing flashing behavior.
+
+Both complete planes must arrive exactly once, LSB then MSB. Missing, duplicate,
+null or out-of-order uploads, explicit cancellation and polarity changes cannot
+activate stale inverted AA. Cleanup restores both physical controller planes
+without refreshing; cancellation forces a clean subsequent B/W refresh. A
+missing baseline never substitutes scratch pixels. Applications should query
+capabilities again after inversion changes and preserve the user's light-mode
+AA preference on unsupported panels.
+
+Run `python3 libs/display/FreeInkDisplay/test/host/run_pro.py --sanitize` for the
+actual facade/driver recording-bus tests in dual- and single-buffer builds.
+They verify literal selector/LUT bytes, unchanged endpoints and timings,
+capability exclusions, activation count, cancellation, power state and B/W
+recovery. Device testing is still required for white-text edge contrast,
+ghosting across repeated turns, temperature behavior and physical tone spacing.
 
 ## Compatibility and migration
 
@@ -121,4 +172,5 @@ equivalence, incomplete uploads, LUT mapping, power state, recovery, inversion,
 and wake, alongside the existing X3/Pro transfer and lifecycle checks. CrossPoint
 tests the four-tone pixel encoding and the separate image/AA quantizers. On hardware, compare AA page turns,
 image pages, inverted reading, and the first page after wake. Include Paper Mono
-for combined-base behavior; the capability refactor changes no waveform tables.
+for combined-base behavior. The inverted native-AA waveform requires separate
+on-panel verification as described above.

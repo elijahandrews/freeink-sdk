@@ -586,6 +586,8 @@ static void testStickyAbsolute() {
   display.releaseBuffers();
 }
 
+#include "test_uc8279_dark.h"
+
 int main(int argc, char**) {
   if (argc > 1) {
     testStickyAbsolute();
@@ -611,5 +613,6 @@ int main(int argc, char**) {
 #ifndef EINK_DISPLAY_SINGLE_BUFFER_MODE
   testGrayCleanupBaseline();
 #endif
+  testUc8279DarkOverlay();
   std::puts("Pro plane bytes, transaction counts, clean refreshes, power state and async frame ownership passed");
 }

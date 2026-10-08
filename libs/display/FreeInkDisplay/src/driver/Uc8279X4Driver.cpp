@@ -103,6 +103,31 @@ struct GrayBank {
   uint8_t data[5][GRAY_LUT_LEN]{};
 };
 
+// Dark native text AA uses complemented absolute selectors. Complement their
+// LUT row address (WW<->BB, BW<->WB), then reverse the SOURCE rail in each
+// phase: 1<->2, preserving neutral/floating rails and every timing/control bit.
+// The native68 VCOM phases are all neutral, so its row stays byte-identical.
+// This reduces to gray 0x83->0x43; the endpoint rows are unchanged. No voltage,
+// temperature or frame-duration tuning is introduced. Native68's two middle
+// rows are identical: this preserves that limitation rather than claiming four
+// distinct optical tones. The reversed waveform still needs panel validation.
+constexpr GrayBank makeInvertedAa68() {
+  GrayBank out{};
+  constexpr uint8_t sourceRows[] = {0, 4, 3, 2, 1};
+  for (unsigned row = 0; row < 5; ++row) {
+    for (unsigned i = 0; i < GRAY_LUT_LEN; ++i) {
+      uint8_t value = kXtfAa68[sourceRows[row]].data[i];
+      if (row != 0 && i % 7 >= 1 && i % 7 <= 4) {
+        const uint8_t rail = value >> 6;
+        if (rail == 1 || rail == 2) value ^= 0xC0;
+      }
+      out.data[row][i] = value;
+    }
+  }
+  return out;
+}
+constexpr GrayBank kInvertedAa68 = makeInvertedAa68();
+
 constexpr GrayBank makeQualityBank() {
   GrayBank out{};
 
@@ -309,7 +334,8 @@ void Uc8279X4Driver::display(EpdBus& bus, const uint8_t* fb, const uint8_t* prev
   // transition instead of a plain DU — this keeps the gray edge charge in check
   // continuously (like the UC8179 sibling), so the periodic Half scrub works
   // without a full flash. Same guard as UC8179.
-  if (mode == RefreshMode::Fast && _redriveAfterGray && _grayRefreshedOnce && _oldPlaneValid && !_needFullClear) {
+  if (!_darkBackground && mode == RefreshMode::Fast && _redriveAfterGray && _grayRefreshedOnce && _oldPlaneValid &&
+      !_needFullClear) {
     transitionGrayscaleBase(bus, fb, turnOff);
     return;
   }
@@ -534,6 +560,22 @@ void Uc8279X4Driver::requestResync(uint8_t settlePasses) {
   _directGrayPass = false;
   (void)settlePasses;
   _needFullClear = true;
+  if (_darkBackground) {
+    _grayBaseValid = false;
+    _absoluteGrayPlanes = false;
+  }
+}
+
+void Uc8279X4Driver::setBackgroundHint(bool darkBackground) {
+  if (_darkBackground == darkBackground) return;
+  _darkBackground = darkBackground;
+  // A polarity change invalidates even a partly uploaded Overlay pass. The next
+  // physical B/W frame must establish a fresh base before any masks are accepted.
+  _grayBaseValid = false;
+  _absoluteGrayPlanes = false;
+  _oldPlaneValid = false;
+  _grayRefreshedOnce = false;
+  requestResync(1);
 }
 
 void Uc8279X4Driver::skipInitialResync() { _needFullClear = false; }
@@ -559,6 +601,7 @@ void Uc8279X4Driver::deepSleep(EpdBus& bus) {
 // conflated them → white-text ghosting). plane0/LSB -> DTM1 (0x10),
 // plane1/MSB -> DTM2 (0x13).
 GrayscaleCapabilities Uc8279X4Driver::grayscaleCapabilities(GrayscaleMode mode) const {
+  if (_darkBackground && !supportsInvertedGrayscale(mode)) return {};
   // LUT_VER 0x67: stock's panel LUT registry (X4 Pro 260917 build) recognizes
   // the id but carries no external-LUT tables for it and excludes it from the
   // ZHX fallback — that panel refreshes from OTP only, with no grayscale path.
@@ -572,8 +615,19 @@ GrayscaleCapabilities Uc8279X4Driver::grayscaleCapabilities(GrayscaleMode mode) 
   return {GrayscaleEncoding::OverlayMasks, GrayscaleBase::Separate, false, false, false};
 }
 
+bool Uc8279X4Driver::supportsInvertedGrayscale(GrayscaleMode mode) const {
+  return mode == GrayscaleMode::Overlay && BoardConfig::ACTIVE.board == BoardConfig::Board::XteinkX4Pro &&
+         BoardConfig::ACTIVE.displayController == BoardConfig::DisplayController::UC8279 &&
+         BoardConfig::ACTIVE.displayControllerVariant == 0x68 && _w == 800 && _h == 480 &&
+         &_cfg == &uc8279X4DefaultConfig() && _grayBase != nullptr;
+}
+
 void Uc8279X4Driver::beginGrayscale(EpdBus& bus, const uint8_t* fb, GrayscaleMode mode, RefreshMode fallback,
                                     bool turnOff) {
+  if (_darkBackground && !supportsInvertedGrayscale(mode)) {
+    requestResync(1);
+    return;
+  }
   _grayImagePass = false;
   _absoluteInput = false;
   _directGrayPass = false;
@@ -592,6 +646,10 @@ void Uc8279X4Driver::beginGrayscale(EpdBus& bus, const uint8_t* fb, GrayscaleMod
 }
 
 void Uc8279X4Driver::copyGrayscaleLsb(EpdBus& bus, const uint8_t* lsb) {
+  if (_darkBackground && (!supportsInvertedGrayscale() || !lsb || !_grayBaseValid || _absoluteGrayPlanes)) {
+    requestResync(1);
+    return;
+  }
   if (!lsb) return;
   if (_absoluteInput) {
     bus.waitBusy(" absolute plane");
@@ -601,7 +659,11 @@ void Uc8279X4Driver::copyGrayscaleLsb(EpdBus& bus, const uint8_t* lsb) {
   _absoluteGrayPlanes = false;
   if (_grayBaseValid && _grayBase != nullptr) {
     // plane0 = base | maskLsb  (base bit = 1 for white, 0 for non-white).
-    for (uint32_t i = 0; i < _bufferSize; i++) _grayBase[i] = static_cast<uint8_t>(_grayBase[i] | lsb[i]);
+    // Dark snapshot C=~logicalBase: Q0=C&~LSB, Q1=Q0^MSB. The selectors
+    // complement the ordinary light-mode selectors; uploads still invert both.
+    for (uint32_t i = 0; i < _bufferSize; i++)
+      _grayBase[i] =
+          _darkBackground ? static_cast<uint8_t>(_grayBase[i] & ~lsb[i]) : static_cast<uint8_t>(_grayBase[i] | lsb[i]);
     streamPlane(bus, CMD_DTM1, _grayBase, /*invert=*/true);
     _absoluteGrayPlanes = true;
   } else {
@@ -620,6 +682,10 @@ void Uc8279X4Driver::copyGrayscaleLsb(EpdBus& bus, const uint8_t* lsb) {
 #endif
 
 void Uc8279X4Driver::copyGrayscaleMsb(EpdBus& bus, const uint8_t* msb) {
+  if (_darkBackground && (!supportsInvertedGrayscale() || !msb || _grayBaseValid || !_absoluteGrayPlanes)) {
+    requestResync(1);
+    return;
+  }
   if (!msb) return;
   if (_absoluteInput) {
     bus.waitBusy(" absolute plane");
@@ -635,11 +701,12 @@ void Uc8279X4Driver::copyGrayscaleMsb(EpdBus& bus, const uint8_t* msb) {
     _grayImagePass = grayPx * 100u > _bufferSize * 8u * FREEINK_UC8279X4_QUALITY_COVERAGE_PCT;
   }
   if (_absoluteGrayPlanes && _grayBase != nullptr) {
-    // plane1 = plane0 ^ maskMsb (streamed inverted). Then recover the B/W base
-    // for the post-DRF restore: base = plane0 & plane1 = plane0 & (plane0 ^ msb).
+    // plane1 = plane0 ^ maskMsb (streamed inverted). Recover the physical B/W
+    // base with AND in light mode, OR in dark mode (De Morgan's law).
     streamPlaneXor(bus, CMD_DTM2, _grayBase, msb, /*invert=*/true);
     for (uint32_t i = 0; i < _bufferSize; i++)
-      _grayBase[i] = static_cast<uint8_t>(_grayBase[i] & (_grayBase[i] ^ msb[i]));
+      _grayBase[i] = _darkBackground ? static_cast<uint8_t>(_grayBase[i] | msb[i])
+                                     : static_cast<uint8_t>(_grayBase[i] & (_grayBase[i] ^ msb[i]));
     _grayBaseValid = true;
   } else {
     streamPlane(bus, CMD_DTM2, msb, /*invert=*/true);  // fallback
@@ -648,6 +715,11 @@ void Uc8279X4Driver::copyGrayscaleMsb(EpdBus& bus, const uint8_t* msb) {
 
 void Uc8279X4Driver::displayGray(EpdBus& bus, const uint8_t* fb, bool turnOff, const unsigned char* lut,
                                  bool factoryMode) {
+  if (_darkBackground && (!supportsInvertedGrayscale() || !_grayBaseValid || !_absoluteGrayPlanes || _absoluteInput ||
+                          _directGrayPass || factoryMode || lut != nullptr)) {
+    requestResync(1);
+    return;
+  }
   (void)lut;
 
   // Vendor AA sequence: PSR (REG=1) -> [planes already in RAM via
@@ -657,7 +729,12 @@ void Uc8279X4Driver::displayGray(EpdBus& bus, const uint8_t* fb, bool turnOff, c
   bus.data(_cfg.psr0);  // 0x33: REG=1, external LUT
   bus.data(_cfg.psr1);
   // Complete image planes need four tones; sparse overlay AA keeps the short stock bank.
-  if (_directGrayPass || _absoluteInput || factoryMode || _grayImagePass) {
+  if (_darkBackground) {
+    for (unsigned i = 0; i < 5; ++i) {
+      bus.cmd(static_cast<uint8_t>(0x20 + i));
+      bus.data(kInvertedAa68.data[i], GRAY_LUT_LEN);
+    }
+  } else if (_directGrayPass || _absoluteInput || factoryMode || _grayImagePass) {
     for (int i = 0; i < 5; i++) {
       bus.cmd(kQualityLutReg[i]);
       bus.data(kQualityBank.data[i], GRAY_LUT_LEN);
@@ -693,8 +770,8 @@ void Uc8279X4Driver::displayGray(EpdBus& bus, const uint8_t* fb, bool turnOff, c
   }
 
   // Restore the clean B/W base to BOTH controller planes (stock gray_aa does the
-  // same). `_grayBase` was rebuilt to the base = plane0 & plane1 in
-  // copyGrayscaleMsb. This keeps the next Fast B/W diff's OLD plane coherent AND
+  // same). copyGrayscaleMsb rebuilt `_grayBase` with AND (light) or OR (dark).
+  // This keeps the next Fast B/W diff's OLD plane coherent AND
   // stops a stale gray selector plane from being reused by a later refresh — the
   // core of why absolute planes de-ghost where raw delta planes did not.
   (void)fb;
@@ -724,8 +801,10 @@ void Uc8279X4Driver::displayGrayscaleBase(EpdBus& bus, const uint8_t* fb, Refres
   // Match the UC8179 sibling: an explicit Full/Half clean, or a
   // state that can't run the non-flashing transition (first AA page / no valid
   // previous / pending full clear), takes a real B/W activation via display().
-  // Otherwise use stock's non-flashing prev->current transition.
-  if (fallback != RefreshMode::Fast || !_grayRefreshedOnce || !_oldPlaneValid || _needFullClear) {
+  // Otherwise use stock's non-flashing prev->current transition. Dark AA has
+  // no validated inverse prebw bank: use ordinary OTP B/W with the existing
+  // all-pixel re-drive flag instead of reusing the light-mode settle waveform.
+  if (_darkBackground || fallback != RefreshMode::Fast || !_grayRefreshedOnce || !_oldPlaneValid || _needFullClear) {
     display(bus, fb, nullptr, fallback, turnOff);
     return;
   }
@@ -821,7 +900,10 @@ void Uc8279X4Driver::cleanupGrayscaleBuffers(EpdBus& bus, const uint8_t* bw) {
   // Re-seed the OLD plane (0x10) with the clean B/W frame the reader restored —
   // same rationale as the UC8179 sibling. (displayGray already restored the base
   // to both planes; this covers callers that reach cleanup by another route.)
-  streamPlane(bus, CMD_DTM1, bw);
+  // Cleanup's input is always the facade's LOGICAL B/W baseline. Ordinary
+  // display()/displayFinish() instead receive already-physical pixels.
+  streamPlane(bus, CMD_DTM1, bw, _darkBackground);
+  if (_darkBackground) streamPlane(bus, CMD_DTM2, bw, true);
   _oldPlaneValid = true;
   // RAM restoration does not cancel a requested physical clean.
 }

@@ -111,6 +111,13 @@ class PanelDriver {
     (void)mode;
     return {};
   }
+  // Explicit opt-in: inverted grayscale needs a matching plane encoding,
+  // waveform and physical B/W baseline; complementing the host bitmap alone
+  // is insufficient. Unsupported drivers retain the inverted B/W fallback.
+  virtual bool supportsInvertedGrayscale(GrayscaleMode mode = GrayscaleMode::Overlay) const {
+    (void)mode;
+    return false;
+  }
   // Compatibility queries describe Overlay mode. New callers use the descriptor.
   virtual bool supportsStripGrayscale() const { return grayscaleCapabilities().stripUploads; }
   // True when an ordinary deferred B/W refresh is a valid base for a

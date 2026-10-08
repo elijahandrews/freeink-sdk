@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Compile the complete Pro drivers and display facade against a recording bus."""
 from pathlib import Path
+import argparse
 import os
 import shutil
 import subprocess
@@ -8,6 +9,9 @@ import tempfile
 
 HERE = Path(__file__).resolve().parent
 LIB = HERE.parents[1]
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument("--sanitize", action="store_true", help="Enable AddressSanitizer and UndefinedBehaviorSanitizer")
+args = parser.parse_args()
 with tempfile.TemporaryDirectory(prefix="freeink-pro-test-") as directory:
     root = Path(directory)
     for folder in ("src/driver", "src/bus", "src/lut", "include"):
@@ -30,6 +34,8 @@ with tempfile.TemporaryDirectory(prefix="freeink-pro-test-") as directory:
         command = [os.environ.get("CXX", "c++"), "-std=c++17", "-Wall", "-Wextra",
                    "-Wno-unused-parameter", "-Wno-unused-function", "-DBOARD_HAS_PSRAM=1",
                    "-DARDUINO=1", "-I"+str(root), "-I"+str(root / "include")]
+        if args.sanitize:
+            command += ["-fsanitize=address,undefined", "-fno-omit-frame-pointer", "-g"]
         if single:
             command += ["-DEINK_DISPLAY_SINGLE_BUFFER_MODE=1"]
         command += [str(HERE / "test_pro.cpp"), str(root / "src/FreeInkDisplay.cpp")]

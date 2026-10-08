@@ -97,6 +97,8 @@ class Uc8279X4Driver : public PanelDriver {
   // stock's panel LUT registry (X4 Pro 260917 build) recognizes but ships no
   // external-LUT tables for — that panel runs OTP waveforms only.
   GrayscaleCapabilities grayscaleCapabilities(GrayscaleMode mode = GrayscaleMode::Overlay) const override;
+  bool supportsInvertedGrayscale(GrayscaleMode mode = GrayscaleMode::Overlay) const override;
+  void setBackgroundHint(bool darkBackground) override;
   void beginGrayscale(EpdBus& bus, const uint8_t* fb, GrayscaleMode mode, RefreshMode fallback, bool turnOff) override;
   void copyGrayscaleLsb(EpdBus& bus, const uint8_t* lsb) override;
   void copyGrayscaleMsb(EpdBus& bus, const uint8_t* msb) override;
@@ -150,6 +152,9 @@ class Uc8279X4Driver : public PanelDriver {
   bool _grayImagePass = false;
   bool _grayBaseValid = false;
   bool _absoluteGrayPlanes = false;
+  // The facade keeps host pixels logical and supplies physical (complemented)
+  // B/W frames. In dark Overlay mode the masks still have their logical meaning.
+  bool _darkBackground = false;
   bool _absoluteInput = false;
   bool _directGrayPass = false;
   bool _directGrayOnPanel = false;
