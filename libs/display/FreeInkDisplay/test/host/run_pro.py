@@ -16,11 +16,12 @@ with tempfile.TemporaryDirectory(prefix="freeink-pro-test-") as directory:
     for name in drivers:
         for ext in ("h", "cpp"):
             shutil.copy2(LIB / f"src/driver/{name}Driver.{ext}", root / f"src/driver/{name}Driver.{ext}")
-    shutil.copy2(LIB / "src/driver/PanelDriver.h", root / "src/driver/PanelDriver.h")
+    for name in ("PanelDriver.h", "X4ProTextAa.h"):
+        shutil.copy2(LIB / "src/driver" / name, root / "src/driver" / name)
     shutil.copy2(LIB / "src/FreeInkDisplay.cpp", root / "src/FreeInkDisplay.cpp")
     shutil.copy2(LIB / "include/FreeInkDisplay.h", root / "include/FreeInkDisplay.h")
     shutil.copy2(LIB / "include/GrayscaleCapabilities.h", root / "include/GrayscaleCapabilities.h")
-    for name in ("Ssd1677Luts.h", "Uc8279X3Luts.h", "UltraChipDirectGrayLuts.h"):
+    for name in ("Ssd1677Luts.h", "Uc8279X3Luts.h", "UltraChipDirectGrayLuts.h", "X4ProTextAaLuts.h"):
         shutil.copy2(LIB / f"src/lut/{name}", root / f"src/lut/{name}")
     for name in ("Arduino.h", "BoardConfig.h", "SPI.h", "esp_heap_caps.h"):
         shutil.copy2(HERE / "pro_stubs" / name, root / name)
@@ -30,6 +31,8 @@ with tempfile.TemporaryDirectory(prefix="freeink-pro-test-") as directory:
         command = [os.environ.get("CXX", "c++"), "-std=c++17", "-Wall", "-Wextra",
                    "-Wno-unused-parameter", "-Wno-unused-function", "-DBOARD_HAS_PSRAM=1",
                    "-DARDUINO=1", "-DFREEINK_DEVICE_METALIO_EINK4=1", "-I"+str(root), "-I"+str(root / "include")]
+        if os.environ.get("SANITIZE") == "1":
+            command += ["-O1", "-fsanitize=address,undefined", "-fno-omit-frame-pointer"]
         if single:
             command += ["-DEINK_DISPLAY_SINGLE_BUFFER_MODE=1"]
         command += [str(HERE / "test_pro.cpp"), str(root / "src/FreeInkDisplay.cpp")]

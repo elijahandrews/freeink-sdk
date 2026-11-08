@@ -126,6 +126,10 @@ class FreeInkDisplay {
   // follows. X3 uses the OEM differential base waveform; other panels display
   // normally with `fallback` mode. See PanelDriver::displayGrayscaleBase.
   void displayGrayscaleBase(RefreshMode fallback = HALF_REFRESH, bool turnOffScreen = false);
+  bool supportsDeferredGrayscaleBase() const;
+  // Dual-buffer only: swap the displayed frame into the active slot like
+  // triggerDisplayAsync. Other configurations take the blocking display path.
+  bool displayGrayscaleBaseAsync(RefreshMode fallback = FAST_REFRESH, bool turnOffScreen = false);
   // Starts a mode-bound pass. Absolute uploads must cover both complete planes
   // (full buffers or consecutive strips per plane) before displayGrayBuffer().
   // False means the requested mode is unavailable; no base was painted.
@@ -297,6 +301,11 @@ class FreeInkDisplay {
   // B/W displayBuffer() when the driver cannot (or the output is inverted --
   // the planes' meaning does not survive inversion).
   bool supportsGrayFrame() const;
+  bool supportsTextAa() const;
+  // Success swaps the displayed target exactly once; failure retains all host
+  // buffers so the caller can display the same new BW page normally.
+  bool tryDisplayTextAa(const uint8_t* lsb, const uint8_t* msb, size_t bytes, bool turnOffScreen = false);
+  void releaseTextAa();
   void displayGrayscaleFrame(RefreshMode mode, bool turnOffScreen = false);
   // Deferred displayGrayscaleFrame(): returns while the waveform runs where the
   // driver can. The caller owes a completeDisplay()/finishDisplayAsync() before it

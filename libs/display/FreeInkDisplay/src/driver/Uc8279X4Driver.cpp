@@ -6,6 +6,7 @@
 #include <string.h>
 
 #include "../lut/Uc8279X3Luts.h"
+#include "../lut/X4ProTextAaLuts.h"
 
 // Orientation of the visible-row stream, switchable per build for field A/B.
 // Defaults (0/0) = the stock convention, HARDWARE-CONFIRMED upright on a field
@@ -284,6 +285,9 @@ void Uc8279X4Driver::initController(EpdBus& bus) {
 }
 
 void Uc8279X4Driver::begin(EpdBus& bus) {
+  _textAa.invalidate();
+  _textAaRegistersDirty = false;
+  _isScreenOn = false;
   _directGrayOnPanel = false;
   _grayImagePass = false;
   _absoluteInput = false;
@@ -305,6 +309,7 @@ void Uc8279X4Driver::begin(EpdBus& bus) {
 }
 
 void Uc8279X4Driver::display(EpdBus& bus, const uint8_t* fb, const uint8_t* prev, RefreshMode mode, bool turnOff) {
+  leaveTextAa(bus);
   // CrossPoint's AA path draws its B/W base with an ordinary Fast paint. Right
   // after an AA page, route that base through stock's non-flashing prev->current
   // transition instead of a plain DU — this keeps the gray edge charge in check
@@ -392,6 +397,7 @@ void Uc8279X4Driver::powerOnIfNeeded(EpdBus& bus, const char* tag) {
 }
 
 bool Uc8279X4Driver::displayStart(EpdBus& bus, const uint8_t* fb, const uint8_t* prev, RefreshMode mode, bool turnOff) {
+  leaveTextAa(bus);
   const bool paintDestination = _directGrayOnPanel;
   _directGrayOnPanel = false;
   _grayImagePass = false;
@@ -512,6 +518,12 @@ void Uc8279X4Driver::startBwRefresh(EpdBus& bus, bool fast) {
 void Uc8279X4Driver::displayFinish(EpdBus& bus, const uint8_t* fb) {
   if (!_pendingRefresh) return;
   _pendingRefresh = false;
+  if (_pendingGrayBase) {
+    _pendingGrayBase = false;
+    transitionGrayscaleBaseFinish(bus, fb, _pendingTurnOff, _pendingGrayPre);
+    _pendingGrayPre = false;
+    return;
+  }
 
   bus.waitRefreshComplete(" 8279x4_DRF");
   if (_pendingPartial) bus.cmd(CMD_PARTIAL_OUT);
@@ -529,7 +541,99 @@ void Uc8279X4Driver::displayFinish(EpdBus& bus, const uint8_t* fb) {
   }
 }
 
+bool Uc8279X4Driver::supportsTextAa() const {
+#if defined(BOARD_HAS_PSRAM) && BOARD_HAS_PSRAM
+  return BoardConfig::ACTIVE.board == BoardConfig::Board::XteinkX4Pro &&
+         BoardConfig::ACTIVE.displayController == BoardConfig::DisplayController::UC8279 &&
+         BoardConfig::ACTIVE.displayControllerVariant == 0x68 && _w == 800 && _h == 480 && _wb == 100;
+#else
+  return false;
+#endif
+}
+
+void Uc8279X4Driver::releaseTextAa() {
+  _textAa.release();
+  if (_textAaRegistersDirty) _needFullClear = true;
+}
+
+void Uc8279X4Driver::leaveTextAa(EpdBus& bus) {
+  _textAa.invalidate();
+  if (!_textAaRegistersDirty) return;
+  // A real reset restores unknown OTP defaults, including register 0x2A.
+  // The next legacy paint must establish a clean optical/DTM baseline too.
+  bus.waitRefreshComplete("text AA exit");
+  if (_isScreenOn) {
+    bus.cmd(CMD_POWER_OFF);
+    bus.waitBusy("text AA exit power");
+  }
+  _isScreenOn = false;
+  bus.reset(50);
+  initController(bus);
+  _textAaRegistersDirty = false;
+  _needFullClear = true;
+  _oldPlaneValid = _grayRefreshedOnce = _redriveAfterGray = false;
+  _grayBaseValid = _absoluteGrayPlanes = _absoluteInput = false;
+  _grayImagePass = _directGrayPass = _directGrayOnPanel = false;
+}
+
+bool Uc8279X4Driver::displayTextAa(EpdBus& bus, const uint8_t* bw, const uint8_t* lsb, const uint8_t* msb, size_t bytes,
+                                   bool turnOff) {
+  if (!supportsTextAa() || _pendingRefresh || _needFullClear || !_textAa.compose(bw, lsb, msb, bytes)) return false;
+  bus.waitBusy("8279 text ready");
+  if (bus.isBusy()) {
+    _textAa.invalidate();
+    _needFullClear = true;
+    return false;
+  }
+  _textAaRegistersDirty = true;
+  bus.cmd(CMD_PANEL_SETTING);
+  bus.data(_cfg.psr0);
+  bus.data(_cfg.psr1);
+  bus.cmd(CMD_PFS);
+  bus.data(0x20);
+  bus.cmd(CMD_GATE_SCAN);
+  bus.data(2);
+  bus.cmd(CMD_PLL);
+  bus.data(0x0F);
+  bus.cmd(0x2A);
+  const uint8_t zero[3] = {};
+  bus.data(zero, sizeof(zero));
+  for (unsigned i = 0; i < 5; ++i) {
+    bus.cmd(0x20 + i);
+    bus.data(kX4ProTextUc8279Zhx + i * 49, 49);
+  }
+  bus.cmd(CMD_VCOM_DATA_INTERVAL);
+  bus.data(0xD7);
+  // Text selectors are NOT inverted. Image AA has a different bank/encoding.
+  streamPlane(bus, CMD_DTM1, _textAa.low());
+  bus.cmd(0x11);
+  streamPlane(bus, CMD_DTM2, _textAa.high());
+  bus.cmd(0x11);
+  powerOnIfNeeded(bus, "8279 text power");
+  bus.cmd(CMD_PANEL_SETTING);
+  bus.data(_cfg.psr0);
+  bus.data(_cfg.psr1);
+  bus.cmd(CMD_DISPLAY_REFRESH);
+  bus.waitRefreshComplete("UC8279 one-pass text AA");
+  if (bus.isBusy()) {
+    leaveTextAa(bus);
+    return false;
+  }
+  _textAa.finish();
+  bus.cmd(CMD_PLL);
+  bus.data(_cfg.pll);
+  _oldPlaneValid = _grayBaseValid = false;
+  _grayRefreshedOnce = _redriveAfterGray = false;
+  if (turnOff) {
+    bus.cmd(CMD_POWER_OFF);
+    bus.waitBusy("text AA power off");
+    _isScreenOn = false;
+  }
+  return true;
+}
+
 void Uc8279X4Driver::requestResync(uint8_t settlePasses) {
+  _textAa.invalidate();
   _grayImagePass = false;
   _absoluteInput = false;
   _directGrayPass = false;
@@ -540,6 +644,7 @@ void Uc8279X4Driver::requestResync(uint8_t settlePasses) {
 void Uc8279X4Driver::skipInitialResync() { _needFullClear = false; }
 
 void Uc8279X4Driver::deepSleep(EpdBus& bus) {
+  leaveTextAa(bus);
   _directGrayOnPanel = false;
   _grayImagePass = false;
   _absoluteInput = false;
@@ -575,6 +680,7 @@ GrayscaleCapabilities Uc8279X4Driver::grayscaleCapabilities(GrayscaleMode mode) 
 
 void Uc8279X4Driver::beginGrayscale(EpdBus& bus, const uint8_t* fb, GrayscaleMode mode, RefreshMode fallback,
                                     bool turnOff) {
+  leaveTextAa(bus);
   _grayImagePass = false;
   _absoluteInput = false;
   _directGrayPass = false;
@@ -593,6 +699,7 @@ void Uc8279X4Driver::beginGrayscale(EpdBus& bus, const uint8_t* fb, GrayscaleMod
 }
 
 void Uc8279X4Driver::copyGrayscaleLsb(EpdBus& bus, const uint8_t* lsb) {
+  leaveTextAa(bus);
   if (!lsb) return;
   if (_absoluteInput) {
     bus.waitBusy(" absolute plane");
@@ -621,6 +728,7 @@ void Uc8279X4Driver::copyGrayscaleLsb(EpdBus& bus, const uint8_t* lsb) {
 #endif
 
 void Uc8279X4Driver::copyGrayscaleMsb(EpdBus& bus, const uint8_t* msb) {
+  leaveTextAa(bus);
   if (!msb) return;
   if (_absoluteInput) {
     bus.waitBusy(" absolute plane");
@@ -649,6 +757,7 @@ void Uc8279X4Driver::copyGrayscaleMsb(EpdBus& bus, const uint8_t* msb) {
 
 void Uc8279X4Driver::displayGray(EpdBus& bus, const uint8_t* fb, bool turnOff, const unsigned char* lut,
                                  bool factoryMode) {
+  leaveTextAa(bus);
   (void)lut;
 
   // Vendor AA sequence: PSR (REG=1) -> [planes already in RAM via
@@ -721,6 +830,7 @@ void Uc8279X4Driver::displayGray(EpdBus& bus, const uint8_t* fb, bool turnOff, c
 }
 
 void Uc8279X4Driver::displayGrayscaleBase(EpdBus& bus, const uint8_t* fb, RefreshMode fallback, bool turnOff) {
+  leaveTextAa(bus);
   if (!fb) return;
   // Match the UC8179 sibling: an explicit Full/Half clean, or a
   // state that can't run the non-flashing transition (first AA page / no valid
@@ -733,8 +843,28 @@ void Uc8279X4Driver::displayGrayscaleBase(EpdBus& bus, const uint8_t* fb, Refres
   transitionGrayscaleBase(bus, fb, turnOff);
 }
 
+bool Uc8279X4Driver::displayGrayscaleBaseStart(EpdBus& bus, const uint8_t* fb, RefreshMode fallback, bool turnOff) {
+  leaveTextAa(bus);
+  if (!fb) return false;
+  _grayImagePass = false;
+  _absoluteInput = false;
+  _directGrayPass = false;
+  if (fallback != RefreshMode::Fast || !_grayRefreshedOnce || !_oldPlaneValid || _needFullClear)
+    return displayStart(bus, fb, nullptr, fallback, turnOff);
+  _pendingGrayPre = transitionGrayscaleBaseStart(bus, fb);
+  _pendingGrayBase = true;
+  _pendingTurnOff = turnOff;
+  _pendingRefresh = true;
+  return true;
+}
+
 void Uc8279X4Driver::transitionGrayscaleBase(EpdBus& bus, const uint8_t* fb, bool turnOff) {
   if (!fb) return;
+  const bool pending = transitionGrayscaleBaseStart(bus, fb);
+  transitionGrayscaleBaseFinish(bus, fb, turnOff, pending);
+}
+
+bool Uc8279X4Driver::transitionGrayscaleBaseStart(EpdBus& bus, const uint8_t* fb) {
   // Snapshot the new B/W base for the AA fold that follows.
   _grayBaseValid = false;
   _absoluteGrayPlanes = false;
@@ -746,7 +876,11 @@ void Uc8279X4Driver::transitionGrayscaleBase(EpdBus& bus, const uint8_t* fb, boo
   // DTM1 retains the previous page's clean B/W base; load the new base into DTM2.
   // The prebw settle waveform drives that transition without an OTP GC flash.
   streamPlane(bus, CMD_DTM2, fb);
-  runGrayscalePrecondition(bus);
+  return startGrayscalePrecondition(bus);
+}
+
+void Uc8279X4Driver::transitionGrayscaleBaseFinish(EpdBus& bus, const uint8_t* fb, bool turnOff, bool pending) {
+  if (pending) finishGrayscalePrecondition(bus);
   // Restore the B/W baseline to DTM1 (an AA upload may overwrite these; the
   // cached snapshot above survives for the fold in copyGrayscale*).
   streamPlane(bus, CMD_DTM1, fb);
@@ -765,8 +899,8 @@ void Uc8279X4Driver::transitionGrayscaleBase(EpdBus& bus, const uint8_t* fb, boo
 // PSR(REG=1) -> PFS -> gate scan -> CDI 0xD7 -> CCSET -> TSSET(fast) -> upload
 // the 5 settle LUTs -> PON -> DRF -> PTOUT. Requires a valid previous page in
 // DTM1 and the new base in DTM2.
-void Uc8279X4Driver::runGrayscalePrecondition(EpdBus& bus) {
-  if (!_oldPlaneValid || !_grayRefreshedOnce) return;
+bool Uc8279X4Driver::startGrayscalePrecondition(EpdBus& bus) {
+  if (!_oldPlaneValid || !_grayRefreshedOnce) return false;
   bus.waitBusy(" 8279x4_gray_pre_ready");
 
   const uint16_t xEnd = static_cast<uint16_t>(_w - 1);
@@ -804,11 +938,20 @@ void Uc8279X4Driver::runGrayscalePrecondition(EpdBus& bus) {
 
   powerOnIfNeeded(bus, " 8279x4_gray_pre_PON");
   bus.cmd(CMD_DISPLAY_REFRESH);
+  // Observe BUSY assertion before allowing the caller to render CPU-only work.
+  const int8_t busyPin = bus.pins().busy;
+  const unsigned long t0 = millis();
+  while (digitalRead(busyPin) == HIGH && millis() - t0 < 50) delay(1);
+  return true;
+}
+
+void Uc8279X4Driver::finishGrayscalePrecondition(EpdBus& bus) {
   bus.waitBusy(" 8279x4_gray_pre_DRF");
   bus.cmd(CMD_PARTIAL_OUT);
 }
 
 void Uc8279X4Driver::cleanupGrayscaleBuffers(EpdBus& bus, const uint8_t* bw) {
+  leaveTextAa(bus);
   _grayImagePass = false;
   _absoluteInput = false;
   _directGrayPass = false;

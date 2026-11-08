@@ -113,6 +113,12 @@ class PanelDriver {
     (void)buf;
   }
 
+  // Synchronous, text-only AA. False means no usable frame was presented;
+  // caller retains its BW target and must use the ordinary display fallback.
+  virtual bool supportsTextAa() const { return false; }
+  virtual bool displayTextAa(EpdBus&, const uint8_t*, const uint8_t*, const uint8_t*, size_t, bool) { return false; }
+  virtual void releaseTextAa() {}
+
   // --- grayscale (dual-plane LSB/MSB) ---
   virtual GrayscaleCapabilities grayscaleCapabilities(GrayscaleMode mode = GrayscaleMode::Overlay) const {
     (void)mode;
@@ -135,6 +141,12 @@ class PanelDriver {
   // base update with calibrated drives); panels without a dedicated base
   // waveform fall back to a plain display() with `fallback` mode, preserving
   // their previous behavior.
+  // The same grayscale-aware base, split for CPU work; retain fb until finish.
+  virtual bool supportsDeferredGrayscaleBase() const { return false; }
+  virtual bool displayGrayscaleBaseStart(EpdBus& bus, const uint8_t* fb, RefreshMode fallback, bool turnOff) {
+    beginGrayscale(bus, fb, GrayscaleMode::Overlay, fallback, turnOff);
+    return false;
+  }
   virtual void displayGrayscaleBase(EpdBus& bus, const uint8_t* fb, RefreshMode fallback, bool turnOff) {
     display(bus, fb, nullptr, fallback, turnOff);
   }

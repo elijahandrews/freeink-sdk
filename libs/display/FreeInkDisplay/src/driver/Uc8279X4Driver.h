@@ -22,6 +22,7 @@
 // production waits one tick and then polls until it returns HIGH.
 
 #include "PanelDriver.h"
+#include "X4ProTextAa.h"
 
 namespace freeink {
 
@@ -77,6 +78,10 @@ class Uc8279X4Driver : public PanelDriver {
   void displayFinish(EpdBus& bus, const uint8_t* fb) override;
   bool supportsAsyncDisplay() const override { return true; }
 
+  bool supportsTextAa() const override;
+  bool displayTextAa(EpdBus& bus, const uint8_t* bw, const uint8_t* lsb, const uint8_t* msb, size_t bytes,
+                     bool turnOff) override;
+  void releaseTextAa() override;
   void requestResync(uint8_t settlePasses) override;
   void skipInitialResync() override;
 
@@ -109,8 +114,15 @@ class Uc8279X4Driver : public PanelDriver {
   // absolute AA path self-cleans per page). The pure-B/W menu keeps its Half
   // scrub because it arrives through display()/displayStart, not this entry.
   void displayGrayscaleBase(EpdBus& bus, const uint8_t* fb, RefreshMode fallback, bool turnOff) override;
+  bool supportsDeferredGrayscaleBase() const override { return true; }
+  bool displayGrayscaleBaseStart(EpdBus& bus, const uint8_t* fb, RefreshMode fallback, bool turnOff) override;
 
  private:
+  X4ProTextAa _textAa;
+  // Controller configuration survives history invalidation/release. Only reset
+  // clears this: 0x2A's OTP default is unknown, so guessing a restore is unsafe.
+  bool _textAaRegistersDirty = false;
+  void leaveTextAa(EpdBus& bus);
   void initController(EpdBus& bus);
   void startBwRefresh(EpdBus& bus, bool fast);
   // Stream a framebuffer into a RAM plane: 0xFF padding for gates before the
@@ -128,7 +140,10 @@ class Uc8279X4Driver : public PanelDriver {
   // the UC8279_aa_prebw_mid settle waveform drives that transition without an OTP
   // GC flash. Ported from the UC8179 sibling; the base is restored to DTM1 after.
   void transitionGrayscaleBase(EpdBus& bus, const uint8_t* fb, bool turnOff);
-  void runGrayscalePrecondition(EpdBus& bus);
+  bool transitionGrayscaleBaseStart(EpdBus& bus, const uint8_t* fb);
+  void transitionGrayscaleBaseFinish(EpdBus& bus, const uint8_t* fb, bool turnOff, bool pending);
+  bool startGrayscalePrecondition(EpdBus& bus);
+  void finishGrayscalePrecondition(EpdBus& bus);
 
   const Uc8279X4Config& _cfg;
 
@@ -164,6 +179,8 @@ class Uc8279X4Driver : public PanelDriver {
   bool _redriveAfterGray = false;
   // Async split state (see Uc8179Driver for the contract).
   bool _pendingRefresh = false;
+  bool _pendingGrayBase = false;
+  bool _pendingGrayPre = false;
   bool _pendingTurnOff = false;
   bool _pendingPartial = false;
 };
