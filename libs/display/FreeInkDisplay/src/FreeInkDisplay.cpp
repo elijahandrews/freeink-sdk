@@ -462,6 +462,7 @@ void FreeInkDisplay::releaseBuffers() {
   if (_secondaryLent) return;
 #endif
   syncPendingAsync();  // a refresh in flight was fed from these buffers
+  if (_driver) _driver->releaseTextAa();
   free(frameBuffer0);
   frameBuffer0 = nullptr;
   frameBuffer = nullptr;
@@ -990,6 +991,33 @@ void FreeInkDisplay::displayGrayscaleBase(RefreshMode fallback, bool turnOffScre
   syncPendingAsync();
   _shadowValid = false;
   _driver->beginGrayscale(_bus, frameBuffer, GrayscaleMode::Overlay, toInternal(fallback), turnOffScreen);
+}
+
+bool FreeInkDisplay::supportsTextAa() const {
+#ifndef EINK_DISPLAY_SINGLE_BUFFER_MODE
+  if (!hasSecondaryBuffer()) return false;
+#endif
+  return !_inverted && !_inversionDirty && frameBuffer && _driver && _driver->supportsTextAa();
+}
+
+bool FreeInkDisplay::tryDisplayTextAa(const uint8_t* lsb, const uint8_t* msb, size_t bytes, bool turnOffScreen) {
+  if (!supportsTextAa() || !lsb || !msb || bytes != bufferSize || _grayscaleMode != freeink::GrayscaleMode::Overlay)
+    return false;
+  DisplayPmLock pmLock;
+  syncPendingAsync();
+  if (!_driver->displayTextAa(_bus, frameBuffer, lsb, msb, bytes, turnOffScreen)) return false;
+#ifndef EINK_DISPLAY_SINGLE_BUFFER_MODE
+  consumePrevFrameFor(FAST_REFRESH);
+  swapBuffers();
+#endif
+  _shadowValid = _redRamSynced = false;
+  _grayPassFailed = false;
+  return true;
+}
+
+void FreeInkDisplay::releaseTextAa() {
+  syncPendingAsync();
+  if (_driver) _driver->releaseTextAa();
 }
 
 bool FreeInkDisplay::supportsDeferredGrayscaleBase() const {

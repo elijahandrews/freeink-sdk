@@ -17,8 +17,9 @@
 //
 // Only the FIRST value record's X-advance adjustment is returned (how much
 // the left glyph's advance changes before drawing the right glyph) — that is
-// the entirety of horizontal pair kerning. Placement adjustments, second-
-// glyph records, and mark/cursive attachment are out of scope.
+// the horizontal advance component this reader supports. Placement
+// adjustments, second-glyph records, and mark/cursive attachment are out
+// of scope.
 
 #include <stddef.h>
 #include <stdint.h>
@@ -27,13 +28,30 @@ namespace freeink {
 namespace font {
 namespace gpos {
 
+// Borrowed for one fixed face instance. Coordinates are normalized 16.16
+// values AFTER avar mapping, in fvar axis order (FreeType's blend coordinates).
+// The parser allocates nothing and shares the pair lookup's bounded work
+// budget.
+struct VariationContext {
+  const uint8_t* gdefBytes = nullptr;
+  size_t gdefSize = 0;
+  const int32_t* coordinates = nullptr;
+  size_t axisCount = 0;
+};
+constexpr size_t kMaxVariationAxes = 16;
+
 // Returns the X-advance adjustment for drawing `rightGlyph` after
 // `leftGlyph`, in FONT UNITS (FUnits, typically negative), or 0 when no
 // active lookup covers the pair (or the table is absent/malformed). Scale by
-// the face's x_scale (FT_MulFix) for 26.6 pixels at the current size.
+// the face's x_scale for 26.6 pixels at the current size; keep an int64
+// intermediate and clamp before narrowing, since deltas can be 32-bit.
 // `gposBytes`/`gposSize` is the raw content of the font's 'GPOS' table (e.g.
 // from FT_Load_Sfnt_Table), not the whole font file.
-int32_t PairKernAdjustment(const uint8_t* gposBytes, size_t gposSize, uint32_t leftGlyph, uint32_t rightGlyph);
+// Optional GDEF ItemVariationStore deltas apply to the first record's XAdvance.
+// Pixel-size Device adjustments and FeatureVariations substitutions are
+// separate mechanisms and are not applied by this design-unit pair-kerning API.
+int32_t PairKernAdjustment(const uint8_t* gposBytes, size_t gposSize, uint32_t leftGlyph, uint32_t rightGlyph,
+                           const VariationContext* variation = nullptr);
 
 }  // namespace gpos
 }  // namespace font

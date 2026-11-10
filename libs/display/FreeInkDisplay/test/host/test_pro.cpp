@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <cassert>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <type_traits>
@@ -11,6 +12,7 @@
 #include "src/driver/Uc8179Driver.h"
 #include "src/driver/Uc8279X4Driver.h"
 #include "src/lut/Ssd1677Luts.h"
+#include "src/lut/X4ProTextAaLuts.h"
 #undef private
 
 using namespace freeink;
@@ -743,6 +745,220 @@ static void testDeferredGrayFacadeUsesCurrentDrawFrame() {
   free(driver._grayBase);
 }
 
+// Per-pixel oracle intentionally uses sorting and independent input decoding.
+// Covers selector history over repeated mixed pages, resets, signed rounding,
+// median recentering, saturation and no-commit failure. Never drives a panel.
+static void testTextAaMath() {
+  X4ProTextAa aa;
+  Bytes bw(48000), lsb(48000), msb(48000), prevInk(384000), expectedLo(48000), expectedHi(48000);
+  std::vector<int> charge(384000), sorted(384000);
+  int median = 0;
+  bool history = false;
+  unsigned rng = 0x18aa5517;
+  const auto random = [&]() {
+    rng ^= rng << 13;
+    rng ^= rng >> 17;
+    rng ^= rng << 5;
+    return rng;
+  };
+  for (unsigned turn = 0; turn < 80; ++turn) {
+    if (turn == 31) {
+      aa.invalidate();
+      history = false;
+      median = 0;
+    }
+    for (unsigned i = 0; i < 48000; ++i) {
+      // Large stable white areas plus dense moving glyph-like regions exercise
+      // white hold, charge correction and the lower median in skewed pages.
+      bw[i] = (i % 13 < 9) ? 0xff : uint8_t(random());
+      lsb[i] = (i % 13 < 9) ? 0 : uint8_t(random());
+      msb[i] = (i % 13 < 9) ? 0 : uint8_t(random());
+    }
+    if (turn % 7 == 0) {
+      std::fill(bw.begin(), bw.end(), 255);
+      std::fill(lsb.begin(), lsb.end(), 0);
+      std::fill(msb.begin(), msb.end(), 0);
+    }
+    std::fill(expectedLo.begin(), expectedLo.end(), 0);
+    std::fill(expectedHi.begin(), expectedHi.end(), 0);
+    for (unsigned pixel = 0; pixel < 384000; ++pixel) {
+      unsigned b = pixel / 8, mask = 128u >> (pixel % 8);
+      bool gray = (lsb[b] & mask) || (msb[b] & mask);
+      bool white = (bw[b] & mask) && !gray;
+      bool hold = history && white && !prevInk[pixel] && charge[pixel] <= median + 11;
+      unsigned code = !white ? (gray ? 1 : 0) : (hold ? 2 : 3);
+      if (code & 1) expectedLo[b] |= mask;
+      if (code & 2) expectedHi[b] |= mask;
+      int decayed = history ? int(std::floor(double(charge[pixel] - median) * 998.0 / 1024.0)) : 0;
+      int dose = code == 0 ? 15 : code == 3 ? -20 : -2;
+      charge[pixel] = std::max(-127, std::min(127, decayed + dose));
+      prevInk[pixel] = !white;
+    }
+    assert(aa.compose(bw.data(), lsb.data(), msb.data(), 48000));
+    assert(std::equal(expectedLo.begin(), expectedLo.end(), aa.low()));
+    assert(std::equal(expectedHi.begin(), expectedHi.end(), aa.high()));
+    aa.finish();
+    sorted = charge;
+    std::nth_element(sorted.begin(), sorted.begin() + 191999, sorted.end());
+    median = sorted[191999];
+    history = true;
+    assert(aa._median == median);
+    const auto* actual = reinterpret_cast<const int8_t*>(aa._storage + 48000 * 3);
+    for (unsigned i = 0; i < 384000; ++i) assert(actual[i] == charge[i]);
+    // A malformed target must neither commit selectors nor destroy history.
+    assert(!aa.compose(bw.data(), lsb.data(), msb.data(), 47999));
+    aa.finish();
+    assert(aa._median == median && aa._history);
+  }
+  aa.release();
+  fakePsramFree = 0;
+  assert(!aa.compose(bw.data(), lsb.data(), msb.data(), 48000));
+  fakePsramFree = 8 * 1024 * 1024;
+  fakePsramLargest = 1;
+  assert(!aa.compose(bw.data(), lsb.data(), msb.data(), 48000));
+  fakePsramLargest = 8 * 1024 * 1024;
+  fakeHeapCapsFail = true;
+  assert(!aa.compose(bw.data(), lsb.data(), msb.data(), 48000));
+  fakeHeapCapsFail = false;
+  assert(aa.compose(bw.data(), lsb.data(), msb.data(), 48000));
+  assert(!aa.compose(nullptr, lsb.data(), msb.data(), 48000));
+  aa.finish();
+  assert(!aa._history);
+  std::puts("Text AA: 80-frame per-pixel oracle, charge history and OOM checks passed");
+}
+
+static unsigned commandCount(const EpdBus& bus, uint8_t cmd) {
+  return std::count_if(bus.writes.begin(), bus.writes.end(), [&](const auto& w) { return w.command == cmd; });
+}
+
+static void testTextAaDriver() {
+  BoardConfig::ACTIVE.board = BoardConfig::Board::XteinkX4Pro;
+  BoardConfig::ACTIVE.displayController = BoardConfig::DisplayController::UC8279;
+  BoardConfig::ACTIVE.displayControllerVariant = 0x68;
+  Bytes bw(48000, 0x8f), lsb(48000, 0x40), msb(48000, 0x20);
+  for (int exit = 0; exit < 10; ++exit) {
+    Uc8279X4Driver d;
+    EpdBus bus;
+    d.begin(bus);
+    // Cold/uncertain glass requires an ordinary clean target before text mode.
+    bus.clear();
+    assert(!d.displayTextAa(bus, bw.data(), lsb.data(), msb.data(), 48000, false));
+    assert(bus.writes.empty());
+    d.display(bus, bw.data(), nullptr, RefreshMode::Full, false);
+    bus.clear();
+    const unsigned resets = bus.resets;
+    assert(d.displayTextAa(bus, bw.data(), lsb.data(), msb.data(), 48000, false));
+    assert(commandCount(bus, 0x12) == 1 && commandCount(bus, 0x10) == 1 && commandCount(bus, 0x13) == 1);
+    assert(commandCount(bus, 0x01) == 0 && commandCount(bus, 0x82) == 0);  // Never change voltage registers.
+    assert(bus.resets == resets);
+    assert(lastPlane(bus, 0x10).size() == 60000 && lastPlane(bus, 0x13).size() == 60000);
+    for (unsigned i = 0; i < 60000; ++i) {
+      assert(lastPlane(bus, 0x10)[i] == (i < 12000 ? 0xff : 0xef));
+      assert(lastPlane(bus, 0x13)[i] == (i < 12000 ? 0xff : 0x8f));
+    }
+    for (unsigned i = 0; i < 5; ++i) {
+      const auto& reg = lastPlane(bus, 0x20 + i);
+      assert(reg.size() == 49 && std::equal(reg.begin(), reg.end(), kX4ProTextUc8279Zhx + i * 49));
+    }
+    assert(d._textAa._history && d._textAaRegistersDirty);
+    bus.clear();
+    assert(d.displayTextAa(bus, bw.data(), lsb.data(), msb.data(), 48000, true));
+    assert(commandCount(bus, 0x12) == 1 && commandCount(bus, 0x02) == 1 && !d._isScreenOn);
+    assert(bus.resets == resets);  // Consecutive text must stay one-pass.
+    if (exit == 0) d.display(bus, bw.data(), nullptr, RefreshMode::Fast, false);
+    if (exit == 1) {
+      d.displayStart(bus, bw.data(), nullptr, RefreshMode::Fast, false);
+      d.displayFinish(bus, bw.data());
+    }
+    if (exit == 2) d.displayGrayscaleBase(bus, bw.data(), RefreshMode::Fast, false);
+    if (exit == 3) {
+      d.displayWindow(bus, bw.data(), nullptr, 0, 0, 800, 480, false);
+    }
+    if (exit == 4) d.beginGrayscale(bus, bw.data(), GrayscaleMode::Direct, RefreshMode::Fast, false);
+    if (exit == 5) d.beginGrayscale(bus, bw.data(), GrayscaleMode::Absolute, RefreshMode::Full, false);
+    if (exit == 6) d.cleanupGrayscaleBuffers(bus, bw.data());
+    if (exit == 7) d.deepSleep(bus);
+    if (exit == 8) {
+      d.requestResync(1);
+      assert(d._textAaRegistersDirty);
+      d.display(bus, bw.data(), nullptr, RefreshMode::Fast, false);
+    }
+    if (exit == 9) {
+      d.releaseTextAa();
+      assert(d._textAaRegistersDirty);
+      d.display(bus, bw.data(), nullptr, RefreshMode::Fast, false);
+    }
+    assert(bus.resets == resets + 1 && !d._textAaRegistersDirty && !d._textAa._history);
+    free(d._grayBase);
+  }
+  Uc8279X4Driver d;
+  EpdBus bus;
+  d.begin(bus);
+  d._needFullClear = false;
+  for (unsigned variant : {0x02, 0x03, 0x67, 0x69, 0xff}) {
+    BoardConfig::ACTIVE.displayControllerVariant = variant;
+    bus.clear();
+    assert(!d.supportsTextAa());
+    assert(!d.displayTextAa(bus, bw.data(), lsb.data(), msb.data(), 48000, false));
+    assert(bus.writes.empty());
+  }
+  BoardConfig::ACTIVE.displayControllerVariant = 0x68;
+  bus.failNextRefresh = true;
+  assert(!d.displayTextAa(bus, bw.data(), lsb.data(), msb.data(), 48000, false));
+  assert(!d._textAa._history && d._needFullClear && !d._textAaRegistersDirty);
+  free(d._grayBase);
+  std::puts(
+      "Text AA driver: single activation, selectors/padding, exact LUT gate, transitions and simulated "
+      "failed-completion recovery passed");
+}
+
+static void testTextAaFacade() {
+  BoardConfig::ACTIVE.displayController = BoardConfig::DisplayController::UC8279;
+  BoardConfig::ACTIVE.displayControllerVariant = 0x68;
+  const auto target = frame(43);
+  Bytes lsb(48000, 0x44), msb(48000, 0x22);
+  for (int reason = 0; reason < 7; ++reason) {
+    Uc8279X4Driver driver;
+    FreeInkDisplay d(12, 11, 13, 18, 14, 6);
+    d._driver = &driver;
+    d.begin();
+    driver._needFullClear = false;
+    memcpy(d.getFrameBuffer(), target.data(), 48000);
+    auto* submitted = d.getFrameBuffer();
+    if (reason == 1) d._inverted = true;
+    if (reason == 2) d._inversionDirty = true;
+    if (reason == 3) driver._needFullClear = true;
+    if (reason == 4) fakeHeapCapsFail = true;
+    if (reason == 5) driver._w = 792;
+#ifndef EINK_DISPLAY_SINGLE_BUFFER_MODE
+    if (reason == 6) assert(d.releaseSecondaryBuffer());
+#endif
+    d._bus.clear();
+    bool ok = d.tryDisplayTextAa(lsb.data(), msb.data(), 48000, false);
+#ifdef EINK_DISPLAY_SINGLE_BUFFER_MODE
+    assert(ok == (reason == 0 || reason == 6));
+#else
+    assert(ok == (reason == 0));
+#endif
+    if (ok) {
+#ifdef EINK_DISPLAY_SINGLE_BUFFER_MODE
+      assert(d.getFrameBuffer() == submitted && std::equal(target.begin(), target.end(), submitted));
+#else
+      assert(d.frameBufferActive == submitted && d.getFrameBuffer() != submitted);
+      assert(std::equal(target.begin(), target.end(), d.frameBufferActive));
+#endif
+    } else {
+      assert(d.getFrameBuffer() == submitted && std::equal(target.begin(), target.end(), submitted));
+      assert(d._bus.writes.empty());
+    }
+    fakeHeapCapsFail = false;
+    d.releaseBuffers();
+    free(driver._grayBase);
+  }
+  std::puts(
+      "Text AA facade: success swaps once; rejected attempts retain the new target; single-buffer target retained");
+}
+
 int main(int argc, char** argv) {
   if (argc > 1 && std::strcmp(argv[1], "metalio") == 0) {
     testMetalio();
@@ -754,6 +970,9 @@ int main(int argc, char** argv) {
     std::puts("Sticky absolute capability, activation, power-down and B/W recovery passed");
     return 0;
   }
+  testTextAaMath();
+  testTextAaDriver();
+  testTextAaFacade();
   testDeferredGrayBase();
   testDeferredGrayFacadeUsesCurrentDrawFrame();
   testUc8179GrayShadeSplit();

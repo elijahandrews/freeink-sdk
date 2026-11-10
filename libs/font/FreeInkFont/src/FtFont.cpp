@@ -226,6 +226,7 @@ void describeFace(FT_Face face, FtFont::FaceInfo& info, char* family, const size
   const auto* os2 = static_cast<const TT_OS2*>(FT_Get_Sfnt_Table(face, FT_SFNT_OS2));
   info.weight = os2 ? os2->usWeightClass : ((face->style_flags & FT_STYLE_FLAG_BOLD) ? 700 : 400);
   info.italic = (face->style_flags & FT_STYLE_FLAG_ITALIC) != 0;
+  info.variable = FT_HAS_MULTIPLE_MASTERS(face);
 }
 
 int32_t fixed16_16To26_6(const long value) {
@@ -321,6 +322,10 @@ void FtFont::deinit() {
   gsubLoadAttempted_ = false;
   freeGposTable();
   gposLoadAttempted_ = false;
+  freeGdefTable();
+  gdefLoadAttempted_ = false;
+  variationAxisCount_ = 0;
+  opticalPointSize26_6_ = 0;
   fontData_ = nullptr;
   fontDataSize_ = 0;
 }
@@ -351,10 +356,40 @@ void FtFont::freeGposTable() {
 
 void FtFont::setGposByteBudget(const size_t maxBytes) {
   gposByteBudget_ = maxBytes;
-  if (gposTableOwned_ && gposTableSize_ > gposByteBudget_) releaseKerningTable();
+  if ((gposTableOwned_ || gdefTableOwned_) &&
+      (gposTableSize_ > gposByteBudget_ || gdefTableSize_ > gposByteBudget_ - gposTableSize_))
+    releaseKerningTable();
+}
+
+bool FtFont::retainLayoutTables(const size_t maxBytes) {
+  if (!ready_) return false;
+  constexpr uint32_t tags[] = {FT_MAKE_TAG('G', 'S', 'U', 'B'), FT_MAKE_TAG('G', 'P', 'O', 'S'),
+                               FT_MAKE_TAG('G', 'D', 'E', 'F')};
+  size_t lengths[3] = {};
+  size_t total = 0;
+  for (unsigned i = 0; i < 3; ++i) {
+    FT_ULong length = 0;
+    if (FT_Load_Sfnt_Table(static_cast<FT_Face>(face_), tags[i], 0, nullptr, &length)) continue;
+    if (length > kMaxGsubBytes || length > maxBytes - total) return false;
+    lengths[i] = length;
+    total += length;
+  }
+  setGsubByteBudget(lengths[0]);
+  setGposByteBudget(lengths[1] + lengths[2]);
+  // A prior bounded optional lookup may have declined a table. Explicit
+  // admission retries it once; already retained borrowed/owned tables survive.
+  if (!gsubTable_) gsubLoadAttempted_ = false;
+  if (!gposTable_) gposLoadAttempted_ = false;
+  if (!gdefTable_) gdefLoadAttempted_ = false;
+  ensureGsubLoaded();
+  ensureGposLoaded();
+  ensureGdefLoaded();
+  return gsubTableSize_ == lengths[0] && gposTableSize_ == lengths[1] && gdefTableSize_ == lengths[2];
 }
 
 void FtFont::releaseKerningTable() {
+  freeGdefTable();
+  gdefLoadAttempted_ = true;
   freeGposTable();
   gposLoadAttempted_ = true;
 }
@@ -448,7 +483,13 @@ bool FtFont::initStream(const ReadFn read, void* ctx, const unsigned long fileSi
 
 bool FtFont::finishInit(const uint16_t sizePx, const int weight, const bool italic) {
   auto face = static_cast<FT_Face>(face_);
-  applyVariation(weight, italic);
+  if (!applyVariation(weight, italic)) {
+    lastInitFailure_ = InitFailure::OpenFace;
+    FT_Done_Face(face);
+    face_ = nullptr;
+    return false;
+  }
+  opticalPointSize26_6_ = 0;
   size26_6_ = 0;
   if (!ensureSize26_6(uint32_t(sizePx) * 64u)) {
     lastInitFailure_ = InitFailure::SetSize;
@@ -461,27 +502,32 @@ bool FtFont::finishInit(const uint16_t sizePx, const int weight, const bool ital
   return true;
 }
 
-void FtFont::applyVariation(const int weight, const bool italic) {
+bool FtFont::applyVariation(const int weight, const bool italic) {
   auto face = static_cast<FT_Face>(face_);
   obliqueShear_ = false;
   emboldenBold_ = false;
   const bool wantBold = weight >= 600;
   FT_MM_Var* mm = nullptr;
-  if (FT_Get_MM_Var(face, &mm) != 0 || mm == nullptr) {
+  if (!FT_HAS_MULTIPLE_MASTERS(face)) {
     // Static face: no axes. Italic → oblique shear; bold → per-glyph outline
     // embolden (see rasterize). A separate Bold/Italic file, when the caller
     // supplies one, is loaded at weight 400 upright so neither synthesis fires.
     obliqueShear_ = italic;
     emboldenBold_ = wantBold;
   } else {
+    if (FT_Get_MM_Var(face, &mm) != 0 || !mm) return false;
+    if (mm->num_axis > 16) {
+      FT_Done_MM_Var(g_lib, mm);
+      return false;
+    }
     FT_Fixed coords[16];
-    const FT_UInt n = mm->num_axis < 16 ? mm->num_axis : 16;
+    const FT_UInt n = mm->num_axis;
     bool haveItalAxis = false;
     bool haveWghtAxis = false;
     for (FT_UInt i = 0; i < n; ++i) {
       coords[i] = mm->axis[i].def;
       const FT_ULong tag = mm->axis[i].tag;
-      if (tag == kTagWght) {
+      if (tag == kTagWght && weight > 0) {
         FT_Fixed w = static_cast<FT_Fixed>(weight) * 65536;
         if (w < mm->axis[i].minimum) w = mm->axis[i].minimum;
         if (w > mm->axis[i].maximum) w = mm->axis[i].maximum;
@@ -495,11 +541,66 @@ void FtFont::applyVariation(const int weight, const bool italic) {
         haveItalAxis = true;
       }
     }
-    FT_Set_Var_Design_Coordinates(face, n, coords);
+    const FT_Error error = FT_Set_Var_Design_Coordinates(face, n, coords);
     FT_Done_MM_Var(g_lib, mm);
+    if (error) return false;
+    variationAxisCount_ = n;
+    if (!updateBlendCoordinates()) return false;
     obliqueShear_ = italic && !haveItalAxis;
     emboldenBold_ = wantBold && !haveWghtAxis;  // variable but no wght axis
   }
+  return true;
+}
+
+bool FtFont::updateBlendCoordinates() {
+  if (!variationAxisCount_) return true;
+  FT_Fixed values[16];
+  if (FT_Get_Var_Blend_Coordinates(static_cast<FT_Face>(face_), variationAxisCount_, values) != 0) return false;
+  for (unsigned i = 0; i < variationAxisCount_; ++i)
+    variationCoordinates_[i] = int32_t(std::clamp<FT_Fixed>(values[i], -65536, 65536));
+  return true;
+}
+
+bool FtFont::isVariable() const { return face_ && FT_HAS_MULTIPLE_MASTERS(static_cast<FT_Face>(face_)); }
+
+bool FtFont::setVariationStyle(const int weight, const bool italic) {
+  if (!ready_) return false;
+  if (!isVariable()) return true;  // Separate static bold/italic files are already styled.
+  if (!applyVariation(weight, italic)) return false;
+  size26_6_ = opticalPointSize26_6_ = 0;
+  return true;
+}
+
+bool FtFont::setOpticalSize26_6(const uint32_t points) {
+  if (!ready_) return false;
+  if (!isVariable() || opticalPointSize26_6_ == points) return true;
+  auto face = static_cast<FT_Face>(face_);
+  FT_MM_Var* mm = nullptr;
+  if (FT_Get_MM_Var(face, &mm) != 0 || !mm) return false;
+  if (mm->num_axis > 16) {
+    FT_Done_MM_Var(g_lib, mm);
+    return false;
+  }
+  FT_Fixed coords[16];
+  bool ok = FT_Get_Var_Design_Coordinates(face, mm->num_axis, coords) == 0;
+  bool changed = false;
+  for (FT_UInt i = 0; ok && i < mm->num_axis; ++i) {
+    if (mm->axis[i].tag != FT_MAKE_TAG('o', 'p', 's', 'z')) continue;
+    const auto value =
+        static_cast<FT_Fixed>(std::clamp<int64_t>(int64_t(points) * 1024, mm->axis[i].minimum, mm->axis[i].maximum));
+    changed |= coords[i] != value;
+    coords[i] = value;
+  }
+  if (ok && changed) {
+    ok = FT_Set_Var_Design_Coordinates(face, mm->num_axis, coords) == 0;
+    if (ok) ok = updateBlendCoordinates();
+  }
+  FT_Done_MM_Var(g_lib, mm);
+  if (ok) {
+    opticalPointSize26_6_ = points;
+    if (changed) size26_6_ = 0;
+  }
+  return ok;
 }
 
 bool FtFont::setRenderOptions(const RenderOptions& options) {
@@ -585,18 +686,19 @@ bool FtFont::ensureSize26_6(const uint32_t pixelSize26_6) {
   return true;
 }
 
-bool FtFont::prepareLoad() {
+bool FtFont::prepareLoad(const int8_t phase26_6) {
   if (!ready_) return false;
   applyGlobalProperties();
   const int64_t syntheticItalic = obliqueShear_ ? 13763 : 0;  // tan(about 12 degrees) in 16.16
   const FT_Fixed shear =
       static_cast<FT_Fixed>(std::clamp<int64_t>(syntheticItalic + options_.slant16_16, INT32_MIN, INT32_MAX));
   FT_Matrix matrix{0x10000L, shear, 0, 0x10000L};
-  FT_Set_Transform(static_cast<FT_Face>(face_), shear ? &matrix : nullptr, nullptr);
+  FT_Vector phase{phase26_6, 0};
+  FT_Set_Transform(static_cast<FT_Face>(face_), shear ? &matrix : nullptr, phase26_6 ? &phase : nullptr);
   return true;
 }
 
-bool FtFont::loadGlyph(const GlyphId glyph, const uint32_t pixelSize26_6) {
+bool FtFont::loadGlyph(const GlyphId glyph, const uint32_t pixelSize26_6, const int8_t phase26_6) {
   lastGlyphFailure_ = GlyphFailure::None;
   lastGlyphError_ = 0;
   if (!face_ || glyph >= static_cast<FT_Face>(face_)->num_glyphs) {
@@ -607,7 +709,7 @@ bool FtFont::loadGlyph(const GlyphId glyph, const uint32_t pixelSize26_6) {
     lastGlyphFailure_ = GlyphFailure::Size;
     return false;
   }
-  if (!prepareLoad()) {
+  if (!prepareLoad(phase26_6)) {
     lastGlyphFailure_ = GlyphFailure::Load;
     return false;
   }
@@ -639,13 +741,15 @@ FtFont::GlyphId FtFont::glyphId(const uint32_t codepoint) const {
   return ready_ ? FT_Get_Char_Index(static_cast<FT_Face>(face_), codepoint) : 0;
 }
 
-bool FtFont::metrics26_6(const uint32_t codepoint, const uint32_t pixelSize26_6, GlyphMetrics& out) {
-  return metricsGlyph26_6(glyphId(codepoint), pixelSize26_6, out);
+bool FtFont::metrics26_6(const uint32_t codepoint, const uint32_t pixelSize26_6, GlyphMetrics& out,
+                         const int8_t phase26_6) {
+  return metricsGlyph26_6(glyphId(codepoint), pixelSize26_6, out, phase26_6);
 }
 
-bool FtFont::metricsGlyph26_6(const GlyphId glyph, const uint32_t pixelSize26_6, GlyphMetrics& out) {
+bool FtFont::metricsGlyph26_6(const GlyphId glyph, const uint32_t pixelSize26_6, GlyphMetrics& out,
+                              const int8_t phase26_6) {
   out = GlyphMetrics{};
-  if (!loadGlyph(glyph, pixelSize26_6)) return false;
+  if (!loadGlyph(glyph, pixelSize26_6, phase26_6)) return false;
   auto slot = static_cast<FT_Face>(face_)->glyph;
   long left = 0;
   long right = 0;
@@ -700,9 +804,13 @@ int32_t FtFont::kerningGlyphs26_6(const GlyphId left, const GlyphId right, const
   // The parser returns font units; x_scale converts to 26.6 at this size.
   ensureGposLoaded();
   if (!gposTable_) return 0;
-  const int32_t funits = gpos::PairKernAdjustment(gposTable_, gposTableSize_, left, right);
+  if (variationAxisCount_) ensureGdefLoaded();
+  const gpos::VariationContext variation{gdefTable_, gdefTableSize_, variationCoordinates_, variationAxisCount_};
+  const int32_t funits = gpos::PairKernAdjustment(gposTable_, gposTableSize_, left, right, &variation);
   if (funits == 0) return 0;
-  return int32_t(std::clamp<FT_Long>(FT_MulFix(funits, face->size->metrics.x_scale), INT32_MIN, INT32_MAX));
+  const int64_t product = int64_t(funits) * face->size->metrics.x_scale;
+  const int64_t scaled = product >= 0 ? (product + 32768) / 65536 : -((-product + 32768) / 65536);
+  return int32_t(std::clamp<int64_t>(scaled, INT32_MIN, INT32_MAX));
 }
 
 bool FtFont::lineMetrics26_6(const uint32_t pixelSize26_6, LineMetrics& out) {
@@ -741,6 +849,12 @@ int16_t FtFont::kerning(const uint32_t left, const uint32_t right, const uint16_
   // GPOS fallback too; round the 26.6 result to whole pixels.
   const int32_t value = kerningGlyphs26_6(glyphId(left), glyphId(right), uint32_t(sizePx) * 64u);
   return int16_t(std::clamp<int32_t>((value + 32) >> 6, INT16_MIN, INT16_MAX));
+}
+
+const uint8_t* FtFont::substitutionTable(size_t& bytes) {
+  ensureGsubLoaded();
+  bytes = gsubTableSize_;
+  return gsubTable_;
 }
 
 void FtFont::ensureGsubLoaded() {
@@ -890,12 +1004,14 @@ const GlyphBitmap* FtFont::rasterize(const uint32_t codepoint, const uint16_t si
   return rasterize26_6(codepoint, uint32_t(sizePx) * 64u);
 }
 
-const GlyphBitmap* FtFont::rasterize26_6(const uint32_t codepoint, const uint32_t pixelSize26_6) {
-  return rasterizeGlyph26_6(glyphId(codepoint), pixelSize26_6);
+const GlyphBitmap* FtFont::rasterize26_6(const uint32_t codepoint, const uint32_t pixelSize26_6,
+                                         const int8_t phase26_6) {
+  return rasterizeGlyph26_6(glyphId(codepoint), pixelSize26_6, phase26_6);
 }
 
-const GlyphBitmap* FtFont::rasterizeGlyph26_6(const GlyphId glyph, const uint32_t pixelSize26_6) {
-  if (!loadGlyph(glyph, pixelSize26_6)) return nullptr;
+const GlyphBitmap* FtFont::rasterizeGlyph26_6(const GlyphId glyph, const uint32_t pixelSize26_6,
+                                              const int8_t phase26_6) {
+  if (!loadGlyph(glyph, pixelSize26_6, phase26_6)) return nullptr;
   FT_GlyphSlot s = static_cast<FT_Face>(face_)->glyph;
   if (s->format != FT_GLYPH_FORMAT_BITMAP) {
     const FT_Error error = FT_Render_Glyph(s, renderModeFor(options_));
@@ -931,5 +1047,44 @@ const GlyphBitmap* FtFont::rasterizeGlyph26_6(const GlyphId glyph, const uint32_
   return &glyph_;
 }
 
+}  // namespace font
+}  // namespace freeink
+
+namespace freeink {
+namespace font {
+void FtFont::freeGdefTable() {
+  if (gdefTableOwned_) fontFree(const_cast<uint8_t*>(gdefTable_));
+  gdefTable_ = nullptr;
+  gdefTableSize_ = 0;
+  gdefTableOwned_ = false;
+}
+void FtFont::ensureGdefLoaded() {
+  if (!ready_ || gdefLoadAttempted_) return;
+  gdefLoadAttempted_ = true;
+  constexpr uint32_t tag = FT_MAKE_TAG('G', 'D', 'E', 'F');
+  if (fontData_) {
+    const uint8_t* table = nullptr;
+    size_t size = 0;
+    if (findSfntTable(fontData_, fontDataSize_, tag, &table, &size) && size <= kMaxGsubBytes) {
+      gdefTable_ = table;
+      gdefTableSize_ = size;
+    }
+    return;
+  }
+  FT_ULong length = 0;
+  auto face = static_cast<FT_Face>(face_);
+  if (FT_Load_Sfnt_Table(face, tag, 0, nullptr, &length) || !length || length > kMaxGsubBytes ||
+      gposTableSize_ > gposByteBudget_ || length > gposByteBudget_ - gposTableSize_)
+    return;
+  auto* buffer = static_cast<uint8_t*>(fontAlloc(length));
+  if (!buffer) return;
+  if (FT_Load_Sfnt_Table(face, tag, 0, buffer, &length)) {
+    fontFree(buffer);
+    return;
+  }
+  gdefTable_ = buffer;
+  gdefTableSize_ = length;
+  gdefTableOwned_ = true;
+}
 }  // namespace font
 }  // namespace freeink

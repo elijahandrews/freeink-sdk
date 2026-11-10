@@ -113,6 +113,11 @@ class PanelDriver {
     (void)buf;
   }
 
+  // Synchronous text-only AA; failure leaves the caller's BW target intact.
+  virtual bool supportsTextAa() const { return false; }
+  virtual bool displayTextAa(EpdBus&, const uint8_t*, const uint8_t*, const uint8_t*, size_t, bool) { return false; }
+  virtual void releaseTextAa() {}
+
   // --- grayscale (dual-plane LSB/MSB) ---
   virtual GrayscaleCapabilities grayscaleCapabilities(GrayscaleMode mode = GrayscaleMode::Overlay) const {
     (void)mode;

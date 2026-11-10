@@ -57,6 +57,7 @@ class FtFont : public RasterFont {
     size_t familyLength = 0;
     uint16_t weight = 400;
     bool italic = false;
+    bool variable = false;
   };
   enum class InspectResult : int8_t { Ok = 0, Unsupported = -1, Unavailable = -2 };
 
@@ -158,14 +159,17 @@ class FtFont : public RasterFont {
   // FreeType alone cannot see. The GPOS table stays cached for the face's
   // lifetime (queries arrive per adjacent pair at render time); a streamed
   // face's owned copy is bounded by setGposByteBudget().
+  // Optional horizontal phase moves the outline before rasterization. Its signed
+  // 26.6 offset is relative to the caller's integer pen; no bitmap resampling.
+  // Each load reapplies its transform, so a phased call cannot alter later calls.
   GlyphId glyphId(uint32_t codepoint) const;
-  bool metrics26_6(uint32_t codepoint, uint32_t pixelSize26_6, GlyphMetrics& out);
-  bool metricsGlyph26_6(GlyphId glyph, uint32_t pixelSize26_6, GlyphMetrics& out);
+  bool metrics26_6(uint32_t codepoint, uint32_t pixelSize26_6, GlyphMetrics& out, int8_t phase26_6 = 0);
+  bool metricsGlyph26_6(GlyphId glyph, uint32_t pixelSize26_6, GlyphMetrics& out, int8_t phase26_6 = 0);
   int32_t kerning26_6(uint32_t left, uint32_t right, uint32_t pixelSize26_6);
   int32_t kerningGlyphs26_6(GlyphId left, GlyphId right, uint32_t pixelSize26_6);
   bool lineMetrics26_6(uint32_t pixelSize26_6, LineMetrics& out);
-  const GlyphBitmap* rasterize26_6(uint32_t codepoint, uint32_t pixelSize26_6);
-  const GlyphBitmap* rasterizeGlyph26_6(GlyphId glyph, uint32_t pixelSize26_6);
+  const GlyphBitmap* rasterize26_6(uint32_t codepoint, uint32_t pixelSize26_6, int8_t phase26_6 = 0);
+  const GlyphBitmap* rasterizeGlyph26_6(GlyphId glyph, uint32_t pixelSize26_6, int8_t phase26_6 = 0);
 
   int16_t advance(uint32_t codepoint, uint16_t sizePx, uint8_t styleFlags) override;
   int16_t lineHeight(uint16_t sizePx) override;
@@ -204,6 +208,9 @@ class FtFont : public RasterFont {
   // face it frees the owned table. Further ligature queries return 0 until the
   // face is initialized again.
   void releaseLigatureTable();
+  // Borrow the bounded GSUB table for an application's additional substitutions.
+  // Valid until releaseLigatureTable()/deinit(); no allocation after the first lookup.
+  const uint8_t* substitutionTable(size_t& bytes);
 
   // GPOS analogues of the GSUB pair above, governing the kerning fallback's
   // table cache. The stream budget matters more here than for GSUB: GPOS
@@ -211,22 +218,33 @@ class FtFont : public RasterFont {
   // rendering), so a streamed face's owned copy stays resident — a rejected
   // or failed load simply disables GPOS kerning (legacy 'kern' still works).
   void setGposByteBudget(size_t maxBytes);
+  // Load every present shaping table under one combined cap. A present table
+  // that cannot be retained fails the face instead of silently changing layout.
+  bool retainLayoutTables(size_t maxBytes);
   void releaseKerningTable();
 
   // Rasterizes one glyph to an 8-bit alpha GlyphBitmap. Valid until the next
   // rasterize() on this face (FreeType glyph-slot lifetime).
   const GlyphBitmap* rasterize(uint32_t codepoint, uint16_t sizePx) override;
 
+  // Native SD faces can retain their default instance (weight=0 on init).
+  // Publishers explicitly select CSS style and optical size in typographic points.
+  bool isVariable() const;
+  bool setVariationStyle(int weight, bool italic);
+  bool setOpticalSize26_6(uint32_t pointSize26_6);
+
  private:
-  void applyVariation(int weight, bool italic);
+  bool applyVariation(int weight, bool italic);
   bool ensureSize26_6(uint32_t pixelSize26_6);
-  bool prepareLoad();
-  bool loadGlyph(GlyphId glyph, uint32_t pixelSize26_6);
+  bool prepareLoad(int8_t phase26_6 = 0);
+  bool loadGlyph(GlyphId glyph, uint32_t pixelSize26_6, int8_t phase26_6 = 0);
   void applyGlobalProperties() const;  // FT_Property_Set, called right before each FT_Load_Glyph
 
   bool finishInit(uint16_t sizePx, int weight, bool italic);  // shared tail of init/initStream
   void ensureGsubLoaded();
   void ensureGposLoaded();
+  void ensureGdefLoaded();
+  bool updateBlendCoordinates();
 
   // A monochrome FT_Bitmap is 1-bpp packed (pitch = (width+7)/8), but
   // GlyphBitmap's contract is 8-bit coverage at stride `width` (see Font.h).
@@ -244,6 +262,7 @@ class FtFont : public RasterFont {
   bool obliqueShear_ = false;  // faux italic (no ital/slnt axis)
   bool emboldenBold_ = false;  // faux bold (static or no wght axis); per-glyph outline embolden
   uint32_t size26_6_ = 0;
+  uint32_t opticalPointSize26_6_ = 0;
   RenderOptions options_{};
   GlyphFailure lastGlyphFailure_ = GlyphFailure::None;
   int lastGlyphError_ = 0;
@@ -289,6 +308,13 @@ class FtFont : public RasterFont {
   bool gposLoadAttempted_ = false;
   size_t gposByteBudget_ = kMaxGsubBytes;
   void freeGposTable();
+  const uint8_t* gdefTable_ = nullptr;
+  size_t gdefTableSize_ = 0;
+  bool gdefTableOwned_ = false;
+  bool gdefLoadAttempted_ = false;
+  uint8_t variationAxisCount_ = 0;
+  int32_t variationCoordinates_[16]{};
+  void freeGdefTable();
 };
 
 }  // namespace font

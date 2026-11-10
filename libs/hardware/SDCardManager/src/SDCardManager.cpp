@@ -535,6 +535,15 @@ bool SDCardManager::openFileForWrite(const char* moduleName, const String& path,
 
 uint64_t SDCardManager::sdTotalBytes() const { return cachedTotalBytes; }
 
+uint64_t SDCardManager::sdFreeBytes() {
+  if (!initialized) return 0;
+  const int32_t freeClusters = vol().freeClusterCount();
+  if (freeClusters < 0) return 0;
+  const uint64_t total = vol().clusterCount();
+  const uint64_t free = static_cast<uint64_t>(freeClusters);
+  return (free > total ? total : free) * vol().bytesPerCluster();
+}
+
 uint64_t SDCardManager::sdUsedBytes() {
   if (!initialized) return 0;
   const uint32_t now = millis();

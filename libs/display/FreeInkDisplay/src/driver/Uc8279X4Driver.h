@@ -22,6 +22,7 @@
 // production waits one tick and then polls until it returns HIGH.
 
 #include "PanelDriver.h"
+#include "X4ProTextAa.h"
 
 namespace freeink {
 
@@ -85,6 +86,10 @@ class Uc8279X4Driver : public PanelDriver {
                      uint16_t h, bool turnOff) override;
   bool supportsAsyncDisplay() const override { return true; }
 
+  bool supportsTextAa() const override;
+  bool displayTextAa(EpdBus& bus, const uint8_t* bw, const uint8_t* lsb, const uint8_t* msb, size_t bytes,
+                     bool turnOff) override;
+  void releaseTextAa() override;
   void requestResync(uint8_t settlePasses) override;
   void skipInitialResync() override;
 
@@ -119,6 +124,9 @@ class Uc8279X4Driver : public PanelDriver {
   void displayGrayscaleBase(EpdBus& bus, const uint8_t* fb, RefreshMode fallback, bool turnOff) override;
 
  private:
+  X4ProTextAa _textAa;
+  bool _textAaRegistersDirty = false;
+  void leaveTextAa(EpdBus& bus);
   void initController(EpdBus& bus);
   void startBwRefresh(EpdBus& bus, bool fast);
   // Stream a framebuffer into a RAM plane: 0xFF padding for gates before the

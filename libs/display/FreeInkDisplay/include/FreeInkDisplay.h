@@ -204,6 +204,9 @@ class FreeInkDisplay {
   // True when the selected driver can use an ordinary deferred B/W refresh as
   // the base for a following grayscale pass.
   bool supportsAsyncGrayscaleBase() const;
+  bool supportsTextAa() const;
+  bool tryDisplayTextAa(const uint8_t* lsb, const uint8_t* msb, size_t bytes, bool turnOffScreen = false);
+  void releaseTextAa();
   bool supportsDeferredGrayscaleBase() const;
   // Framebuffer must remain unchanged until waitRefreshComplete().
   bool displayGrayscaleBaseAsync(RefreshMode fallback = FAST_REFRESH);
