@@ -831,6 +831,53 @@ static unsigned commandCount(const EpdBus& bus, uint8_t cmd) {
   return std::count_if(bus.writes.begin(), bus.writes.end(), [&](const auto& w) { return w.command == cmd; });
 }
 
+static void testMonochromeWindowAfterGray() {
+  BoardConfig::ACTIVE.displayControllerVariant = 0x68;
+  Uc8279X4Driver driver;
+  FreeInkDisplay display(12, 11, 13, 18, 14, 6);
+  display._driver = &driver;
+  display.begin();
+  const auto bw = frame(21);
+  const auto low = frame(22), high = frame(23);
+  for (bool keep : {false, true}) {
+    std::memcpy(display.getFrameBuffer(), bw.data(), bw.size());
+    assert(display.displayGrayscaleBase(GrayscaleMode::Absolute));
+    display.copyGrayscaleBuffers(low.data(), high.data());
+    display.displayGrayBuffer(true, nullptr, false, keep);
+    display.cleanupGrayscaleBuffers(bw.data());
+    // Two footer updates, with a real gray page underneath. The second must
+    // preserve the same post-gray obligation as the first.
+    for (int n = 0; n < 2; ++n) {
+      auto& bus = display._bus;
+      bus.clear();
+      assert(!display.tryMonochromeWindow(7, 20, 32, 100));
+      assert(bus.writes.empty());
+      display.getFrameBuffer()[20 * 100 + 1] ^= 1;
+      bool ok = display.tryMonochromeWindow(8, 20, 32, 100, true);
+#ifdef EINK_DISPLAY_SINGLE_BUFFER_MODE
+      assert(ok == keep);
+#else
+      assert(!ok);
+#endif
+      if (ok) {
+        assert(commandCount(bus, 0x12) == 1 && commandCount(bus, 0x90) == 1);
+        const auto window = std::find_if(bus.writes.begin(), bus.writes.end(), [](const auto& w){return w.command == 0x90;});
+        assert(window->bytes == Bytes({0, 8, 0, 39, 0, 140, 0, 239, 1}));
+        assert(driver._redriveAfterGray && !driver._isScreenOn);
+      } else {
+        assert(bus.writes.empty());
+      }
+    }
+    display.requestResync();
+    display._bus.clear();
+    assert(!display.tryMonochromeWindow(8, 20, 32, 100));
+    assert(display._bus.writes.empty());
+  }
+  display.releaseBuffers();
+  free(driver._grayBase);
+  std::puts("Monochrome window after cover: a single local activation, preserved gray state and safe fallback passed");
+}
+
 static void testTextAaDriver() {
   BoardConfig::ACTIVE.board = BoardConfig::Board::XteinkX4Pro;
   BoardConfig::ACTIVE.displayController = BoardConfig::DisplayController::UC8279;
@@ -970,6 +1017,7 @@ int main(int argc, char** argv) {
     std::puts("Sticky absolute capability, activation, power-down and B/W recovery passed");
     return 0;
   }
+  testMonochromeWindowAfterGray();
   testTextAaMath();
   testTextAaDriver();
   testTextAaFacade();

@@ -280,9 +280,14 @@ class FreeInkDisplay {
   // True when the runtime-selected panel is the Xteink X3 (X4 returns false).
   bool isX3Mode() const { return _panelSel == PanelSel::X3; }
 
+  // Caller supplies a byte-aligned black/white region of the current frame.
+  // A false result leaves the panel untouched and permits a normal redraw.
+  bool tryMonochromeWindow(uint16_t x, uint16_t y, uint16_t w, uint16_t h, bool turnOffScreen = false);
+
   // EXPERIMENTAL: Windowed update - display only a rectangular region
   void displayWindow(uint16_t x, uint16_t y, uint16_t w, uint16_t h, bool turnOffScreen = false);
-  void displayGrayBuffer(bool turnOffScreen = false, const unsigned char* lut = nullptr, bool factoryMode = false);
+  void displayGrayBuffer(bool turnOffScreen = false, const unsigned char* lut = nullptr,
+                         bool factoryMode = false, bool keepWindowBaseline = false);
   void displayGrayCalibration(uint16_t customX, uint16_t customY, uint16_t customW, uint16_t customH);
 
   void refreshDisplay(RefreshMode mode = FAST_REFRESH, bool turnOffScreen = false);

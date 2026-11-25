@@ -518,6 +518,20 @@ void Uc8279X4Driver::startBwRefresh(EpdBus& bus, bool fast) {
   }
 }
 
+bool Uc8279X4Driver::tryMonochromeWindow(EpdBus& bus, const uint8_t* fb, uint16_t x, uint16_t y,
+                                         uint16_t w, uint16_t h, bool turnOff) {
+  if (!fb || !w || !h || (x & 7) || (w & 7) || uint32_t(x) + w > _w || uint32_t(y) + h > _h ||
+      !_oldPlaneValid || _needFullClear || _pendingRefresh || _textAaRegistersDirty || _directGrayOnPanel) return false;
+
+  // The caller guarantees this aligned window contains only black/white ink.
+  // Its saved BW baseline is valid here even when other pixels remain gray.
+  const bool grayOutside = _redriveAfterGray;
+  _redriveAfterGray = false;
+  displayWindow(bus, fb, nullptr, x, y, w, h, turnOff);
+  _redriveAfterGray = grayOutside;
+  return true;
+}
+
 // Refresh a single rectangle instead of the whole panel.
 //
 // The heavy cost on this glass is the DRF waveform, which scans gate lines; the

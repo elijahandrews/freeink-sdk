@@ -875,6 +875,19 @@ void FreeInkDisplay::displayBufferAsyncNoShadow(RefreshMode mode) {
   displayAsyncImpl(mode, /*turnOffScreen=*/false, /*noShadow=*/true);
 }
 
+bool FreeInkDisplay::tryMonochromeWindow(uint16_t x, uint16_t y, uint16_t w, uint16_t h, bool turnOffScreen) {
+#ifdef EINK_DISPLAY_SINGLE_BUFFER_MODE
+  if (_inverted || _inversionDirty || _grayscaleMode != GrayscaleMode::Overlay) return false;
+  DisplayPmLock pmLock;
+  syncPendingAsync();
+  if (!_driver->tryMonochromeWindow(_bus, frameBuffer, x, y, w, h, turnOffScreen)) return false;
+  _shadowValid = _redRamSynced = false;
+  return true;
+#else
+  return false;
+#endif
+}
+
 void FreeInkDisplay::displayWindow(uint16_t x, uint16_t y, uint16_t w, uint16_t h, bool turnOffScreen) {
   cancelGrayscalePass();
   DisplayPmLock pmLock;
@@ -897,7 +910,8 @@ void FreeInkDisplay::displayWindow(uint16_t x, uint16_t y, uint16_t w, uint16_t 
 #endif
 }
 
-void FreeInkDisplay::displayGrayBuffer(bool turnOffScreen, const unsigned char* lut, bool factoryMode) {
+void FreeInkDisplay::displayGrayBuffer(bool turnOffScreen, const unsigned char* lut, bool factoryMode,
+                                      bool keepWindowBaseline) {
 #if defined(SSD1677_PROBE_DEBUG) && SSD1677_PROBE_DEBUG
   Serial.printf("[EPD] displayGrayBuffer\n");
 #endif
@@ -916,7 +930,15 @@ void FreeInkDisplay::displayGrayBuffer(bool turnOffScreen, const unsigned char* 
     }
     _driver->displayGray(_bus, frameBuffer, turnOffScreen, nullptr, true);
     _inversionDirty = false;
-    cancelGrayscalePass();
+    if (keepWindowBaseline && _grayscaleMode == GrayscaleMode::Absolute && _driver->supportsMonochromeWindow()) {
+      // Both absolute planes were complete. The caller will restore the B/W
+      // framebuffer before requesting a B/W-only window. Preserve the valid
+      // driver baseline and its independent whole-page post-gray re-drive flag.
+      _grayscaleMode = GrayscaleMode::Overlay;
+      _grayRows[0] = _grayRows[1] = 0;
+    } else {
+      cancelGrayscalePass();
+    }
     return;
   }
   _driver->displayGray(_bus, frameBuffer, turnOffScreen, lut, factoryMode);

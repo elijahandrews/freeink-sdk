@@ -63,6 +63,13 @@ class PanelDriver {
     display(bus, fb, prev, RefreshMode::Fast, turnOff);
   }
 
+  // Present an already monochrome region, preserving visible gray outside it.
+  // Return false without a panel activation if a local update is unavailable.
+  virtual bool supportsMonochromeWindow() const { return false; }
+  virtual bool tryMonochromeWindow(EpdBus&, const uint8_t*, uint16_t, uint16_t, uint16_t, uint16_t, bool) {
+    return false;
+  }
+
   // True when displayStart() defers (returns true) rather than completing
   // inline. Lets the facade skip async scaffolding (shadow setup) on blocking
   // drivers without a trial call, and lets hosts size overlap buffers up
