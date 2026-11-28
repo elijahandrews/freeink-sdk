@@ -104,6 +104,29 @@ static void expectIdlePower(Ssd1677Driver& d) {
   assert(!d._isScreenOn && d._needsGrayClear);
 }
 
+static void expectPackedPairs(Ssd2677Driver& driver) {
+  const size_t size = driver.geometry().bufferSize;
+  Bytes high(size), low(size);
+  for (unsigned start = 0; start < 65536; start += size) {
+    for (size_t i = 0; i < size; ++i) {
+      high[i] = (start + i) >> 8;
+      low[i] = start + i;
+    }
+    EpdBus bus;
+    driver.sendPacked(bus, high.data(), low.data());
+    assert(bus.writes.size() == 1 && bus.writes[0].command == 0x10);
+    const auto& packed = bus.writes[0].bytes;
+    assert(packed.size() == size * 2);
+    for (size_t i = 0; i < size; ++i) {
+      uint16_t expected = 0;
+      const uint8_t hi = high[i];
+      for (int bit = 7; bit >= 0; --bit)
+        expected = (expected << 2) | (((hi >> bit) & 1) << 1) | ((low[i] >> bit) & 1);
+      assert(packed[i * 2] == expected >> 8 && packed[i * 2 + 1] == (expected & 255));
+    }
+  }
+}
+
 int main(int argc, char** argv) {
   const char* which = argc > 1 ? argv[1] : "yrd";
   static const uint8_t yrd[10] = {0xCA, 0xFE, 0x00, 0x16, 0x77, 0x02, 0x10, 0x01, 0x00, 0x91};
@@ -134,6 +157,7 @@ int main(int argc, char** argv) {
     assert(s.busyPolarity() == BusyPolarity::ActiveLow);
     EpdBus bus;
     s.begin(bus);
+    expectPackedPairs(s);
     assert(lastRegister(bus, 0x00) == 0x27 && lastRegister(bus, 0xE9) == 0x01);
     // Picco's final init command has no per-command wait: keep the final
     // completion wait as well as the reset wait.
@@ -253,6 +277,41 @@ int main(int argc, char** argv) {
       assert(w.command != 0x07);  // no deep sleep
     }
     assert(poweredOn && lastRegister(bus, 0x02) == 0 && s._needsPowerOn);
+    Bytes masks(48000, 0), other(48000, 0);
+    masks[0] = 0x40;
+    other[0] = 0x20;
+    newFb[0] = 0x7f;
+    bus.clear();
+    fakePsramFree = 0;
+    assert(!s.displayTextAa(bus, newFb.data(), masks.data(), other.data(), 48000, true));
+    assert(bus.writes.empty());
+    fakePsramFree = 8 * 1024 * 1024;
+    for (int turn = 0; turn < 2; ++turn) {
+      bus.clear();
+      assert(s.displayTextAa(bus, newFb.data(), masks.data(), other.data(), 48000, true));
+      int activations = 0, transfers = 0, waveforms = 0;
+      for (const auto& w : bus.writes) {
+        if (w.command == 0x12) ++activations;
+        if (w.command == 0x10) {
+          ++transfers;
+          assert(w.bytes.size() == 96000);
+          // Black, gray, gray, white. Unchanged white holds on the second turn.
+          assert(w.bytes[0] == (turn ? 0x16 : 0x17));
+        }
+        if (w.command == 0x20) {
+          ++waveforms;
+          assert(w.bytes == Bytes(lut_picco_se0400_text, lut_picco_se0400_text + 535));
+        }
+      }
+      assert(activations == 1 && transfers == 1 && waveforms == 1);
+    }
+    assert(s._grayPending && s._lsb[0] == 0x60);
+    s.releaseTextAa();
+    bus.clear();
+    s.display(bus, white.data(), nullptr, RefreshMode::Fast, true);
+    assert(!s._grayPending);
+    for (const auto& w : bus.writes)
+      if (w.command == 0x10) assert(w.bytes[0] == 0x57);  // gray and black driven to white
     s.deepSleep(bus);
     assert(lastRegister(bus, 0x07) == 0xA5);
     std::printf("Picco se0400: probe, init, packing and refresh passed\n");

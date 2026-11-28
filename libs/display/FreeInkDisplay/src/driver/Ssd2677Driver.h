@@ -25,6 +25,9 @@
 #include <BoardConfig.h>
 
 #include "PanelDriver.h"
+#if FREEINK_DEVICE_PICCO
+#include "X4ProTextAa.h"
+#endif
 
 namespace freeink {
 
@@ -53,7 +56,13 @@ class Ssd2677Driver : public PanelDriver {
       return {GrayscaleEncoding::AbsolutePlanes, GrayscaleBase::Combined, false, false, false};
     return {};
   }
-  void requestResync(uint8_t) override { _absoluteGray = false; }
+  void requestResync(uint8_t) override;
+#if FREEINK_DEVICE_PICCO
+  bool supportsTextAa() const override { return true; }
+  bool displayTextAa(EpdBus& bus, const uint8_t* bw, const uint8_t* lsb, const uint8_t* msb, size_t bytes,
+                     bool turnOff) override;
+  void releaseTextAa() override { _textAa.release(); }
+#endif
   void beginGrayscale(EpdBus& bus, const uint8_t* fb, GrayscaleMode mode, RefreshMode fallback, bool turnOff) override;
   void copyGrayscaleLsb(EpdBus& bus, const uint8_t* lsb) override;
   void copyGrayscaleMsb(EpdBus& bus, const uint8_t* msb) override;
@@ -68,6 +77,10 @@ class Ssd2677Driver : public PanelDriver {
   void powerAndRefresh(EpdBus& bus, bool turnOff);
   void refreshWith(EpdBus& bus, const unsigned char* lut, bool turnOff);
 
+#if FREEINK_DEVICE_PICCO
+  X4ProTextAa _textAa;
+  bool _grayPending = false;
+#endif
   bool _needsPowerOn = true;
   bool _needsInitialFull = true;
   uint8_t _latchedWaveform = 0;  // Sticky: OTP waveform code currently latched (0 = none)

@@ -84,11 +84,41 @@ constexpr uint16_t LUT_LEN = 535;
 // 8 pixels of old + new -> two bytes of 2-bit pixels, old in the high bit,
 // MSB-first (stock FUN_422869b4).
 inline void packPixels(uint8_t oldByte, uint8_t newByte, uint8_t* out) {
-  uint16_t v = 0;
-  for (int i = 7; i >= 0; --i) v = static_cast<uint16_t>((v << 2) | (((oldByte >> i) & 1) << 1) | ((newByte >> i) & 1));
-  out[0] = static_cast<uint8_t>(v >> 8);
-  out[1] = static_cast<uint8_t>(v);
+  // Spread four bits into the even positions. A 16-byte flash table replaces
+  // eight per-pixel shifts for every framebuffer byte, preserving wire order.
+  static constexpr uint8_t spread[] = {0x00, 0x01, 0x04, 0x05, 0x10, 0x11, 0x14, 0x15,
+                                       0x40, 0x41, 0x44, 0x45, 0x50, 0x51, 0x54, 0x55};
+  out[0] = static_cast<uint8_t>((spread[oldByte >> 4] << 1) | spread[newByte >> 4]);
+  out[1] = static_cast<uint8_t>((spread[oldByte & 15] << 1) | spread[newByte & 15]);
 }
+
+#if FREEINK_DEVICE_PICCO
+inline int lutCount(uint8_t v) {
+  static constexpr uint8_t bits[6] = {4, 7, 6, 1, 0, 3};
+  int n = 0;
+  for (int i = 0; i < 6; ++i) n |= ((~v >> bits[i]) & 1) << i;
+  return n;
+}
+
+int ssd2677LutDose(const unsigned char* lut, unsigned table) {
+  // Level byte, active-low: white drive on bits 5/3/1, black on bits 2/0/6 (see Ssd2677Luts.h).
+  static constexpr uint8_t white[3] = {5, 3, 1}, black[3] = {2, 0, 6};
+  int dose = 0;
+  for (unsigned group = 0; group < 8; ++group) {
+    const unsigned char* g = lut + 7 + table * 88 + group * 11;
+    int net = 0;
+    for (unsigned phase = 0; phase < 8; ++phase) {
+      if (phase % 4 == 3) continue;
+      const uint8_t levels = g[1 + phase / 4];
+      const int frames = lutCount(g[3 + phase]);
+      if (!((levels >> black[phase % 4]) & 1)) net += frames;
+      if (!((levels >> white[phase % 4]) & 1)) net -= frames;
+    }
+    dose += net * lutCount(g[0]);
+  }
+  return dose;
+}
+#endif
 
 }  // namespace
 
@@ -148,6 +178,7 @@ void Ssd2677Driver::latchOtpWaveform(EpdBus& bus, uint8_t code) {
 void Ssd2677Driver::begin(EpdBus& bus) {
   initPanel(bus);
 
+  requestResync(0);
   _needsInitialFull = true;
   // Retained old-plane: this panel takes old+new as one 2bpp burst, so the old
   // plane must exactly equal what is physically on the glass. The host can't
@@ -164,6 +195,15 @@ void Ssd2677Driver::display(EpdBus& bus, const uint8_t* fb, const uint8_t* prev,
   (void)prev;  // unused: single-buffer host passes null; we track our own old plane
   // First paint after init clears the panel with the full waveform (stock forces
   // mode 0 on the first frame).
+#if FREEINK_DEVICE_PICCO
+  _textAa.invalidate();
+  if (_grayPending) {
+    // Previously gray pixels need a transition even if both B/W pages agree.
+    for (uint32_t i = 0; i < geometry().bufferSize; ++i)
+      _old[i] = (_old[i] & ~_lsb[i]) | (~fb[i] & _lsb[i]);
+    _grayPending = false;
+  }
+#endif
   if (_needsInitialFull) mode = RefreshMode::Full;
   if (isSticky()) {
     // OTP waveforms: a full refresh sends old == new (every pixel driven to its
@@ -261,6 +301,13 @@ void Ssd2677Driver::copyGrayscaleLsb(EpdBus& bus, const uint8_t* lsb) {
 void Ssd2677Driver::beginGrayscale(EpdBus& bus, const uint8_t* fb, GrayscaleMode mode, RefreshMode fallback,
                                    bool turnOff) {
   _absoluteGray = mode == GrayscaleMode::Absolute;
+#if FREEINK_DEVICE_PICCO
+  if (_absoluteGray) {
+    _textAa.invalidate();
+    if (_grayPending) _needsInitialFull = true;
+    _grayPending = false;
+  }
+#endif
   if (_absoluteGray) {
     // The caller still has the B/W base here. On allocation failure display it
     // before the renderer reuses its framebuffer for the two image planes.
@@ -343,7 +390,36 @@ void Ssd2677Driver::displayGray(EpdBus& bus, const uint8_t* fb, bool turnOff, co
   // AA-edge residual (stock does the same — its gray present sets no full flag).
 }
 
+void Ssd2677Driver::requestResync(uint8_t) {
+  _absoluteGray = false;
+#if FREEINK_DEVICE_PICCO
+  _textAa.invalidate();
+  if (_grayPending) _needsInitialFull = true;
+  _grayPending = false;
+#endif
+}
+
+#if FREEINK_DEVICE_PICCO
+bool Ssd2677Driver::displayTextAa(EpdBus& bus, const uint8_t* bw, const uint8_t* lsb, const uint8_t* msb,
+                                  size_t bytes, bool /*turnOff*/) {
+  if (_needsInitialFull || !_old || !ensureLsb() || !_textAa.compose(bw, lsb, msb, bytes)) return false;
+  powerOn(bus);
+  sendPacked(bus, _textAa.high(), _textAa.low());
+  refreshWith(bus, lut_picco_se0400_text, true);
+  static const int doses[4] = {ssd2677LutDose(lut_picco_se0400_text, 1), ssd2677LutDose(lut_picco_se0400_text, 2),
+                               ssd2677LutDose(lut_picco_se0400_text, 3), ssd2677LutDose(lut_picco_se0400_text, 4)};
+  _textAa.finish(doses, 512);
+  for (size_t i = 0; i < bytes; ++i) {
+    _lsb[i] = lsb[i] | msb[i];
+    _old[i] = bw[i] | _lsb[i];  // upstream baseline treats gray as white
+  }
+  _grayPending = true;
+  return true;
+}
+#endif
+
 void Ssd2677Driver::deepSleep(EpdBus& bus) {
+  requestResync(0);
   powerOffBetweenFrames(bus);
   // Stock (FUN_4200b608): 0x07 with the 0xA5 check code.
   bus.cmd(CMD_DEEP_SLEEP);

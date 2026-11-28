@@ -18,6 +18,7 @@ def build(board, device_macro, test_cpp, directory):
     for name in ("Ssd1677", "Ssd2677"):
         for ext in ("h", "cpp"):
             shutil.copy2(LIB / f"src/driver/{name}Driver.{ext}", root / f"src/driver/{name}Driver.{ext}")
+    shutil.copy2(LIB / "src/driver/X4ProTextAa.h", root / "src/driver/X4ProTextAa.h")
     shutil.copy2(LIB / "src/driver/PanelDriver.h", root / "src/driver/PanelDriver.h")
     shutil.copy2(LIB / "include/GrayscaleCapabilities.h", root / "include/GrayscaleCapabilities.h")
     for name in ("Ssd1677Luts.h", "Ssd2677Luts.h"):
@@ -85,7 +86,7 @@ inline FakeSerial Serial;
     shutil.copy2(LIB / "include/FreeInkDisplay.h", root / "include/FreeInkDisplay.h")
     exe = root / board.lower()
     subprocess.run([os.environ.get("CXX", "c++"), "-std=c++17", "-Wall", "-Wextra", "-Wno-unused-parameter",
-                    "-Wno-unused-function", "-Wno-unused-variable", "-DARDUINO=1", f"-D{device_macro}=1", "-DFREEINK_DRIVER_SSD1677=1",
+                    "-Wno-unused-function", "-Wno-unused-variable", "-DARDUINO=1", "-DBOARD_HAS_PSRAM=1", f"-D{device_macro}=1", "-DFREEINK_DRIVER_SSD1677=1",
                     "-I" + str(root), "-I" + str(root / "include"), str(HERE / test_cpp),
                     str(root / "src/FreeInkDisplay.cpp"), str(root / "src/driver/Ssd1677Driver.cpp"),
                     str(root / "src/driver/Ssd2677Driver.cpp"), "-o", str(exe)], check=True)

@@ -62,25 +62,45 @@ class X4ProTextAa {
   // Commit only after the display's BUSY completion. Selector codes (hi,lo):
   // 00 black, 01 gray, 10 white hold, 11 white clear. Negative decay rounds DOWN.
   void finish() {
+    static constexpr int x4Doses[4] = {15, -2, -2, -20};
+    finish(x4Doses, 0);
+  }
+  // The Picco firmware rounds charge decay to nearest (+512 before shifting).
+  void finish(const int (&doses)[4], int roundingBias) {
     if (!_composed) return;
     auto* ink = _storage + SIZE * 2;
     auto* charge = reinterpret_cast<int8_t*>(_storage + SIZE * 3);
     auto* histogram = reinterpret_cast<uint32_t*>(_storage + SIZE * 11);
     memset(histogram, 0, 256 * sizeof(uint32_t));
-    static constexpr int doses[4] = {15, -2, -2, -20};
+    const auto nextCharge = [&](int previous, unsigned code) __attribute__((always_inline)) {
+      int v = _history ? ((previous - _median) * 998 + roundingBias) >> 10 : 0;
+      v += doses[code];
+      return v < -127 ? -127 : v > 127 ? 127 : v;
+    };
     for (uint32_t i = 0; i < SIZE; ++i) {
       const auto lo = low()[i], hi = high()[i];
       ink[i] = ~hi;
+      // Blank paper and solid strokes commonly have eight equal transitions
+      // and charges. Update those pixels together, including their histogram
+      // weight. memcpy keeps this safe on unaligned PSRAM addresses.
+      if ((lo == 0 || lo == 0xff) && (hi == 0 || hi == 0xff)) {
+        constexpr uint64_t repeatByte = UINT64_C(0x0101010101010101);
+        uint64_t previous = 0;
+        if (_history) memcpy(&previous, charge + i * 8, sizeof(previous));
+        const uint8_t first = static_cast<uint8_t>(previous);
+        if (!_history || previous == repeatByte * first) {
+          const unsigned code = (hi & 2) | (lo & 1);
+          const int v = nextCharge(static_cast<int8_t>(first), code);
+          const uint64_t repeated = repeatByte * static_cast<uint8_t>(v);
+          memcpy(charge + i * 8, &repeated, sizeof(repeated));
+          histogram[v + 128] += 8;
+          continue;
+        }
+      }
       for (unsigned bit = 0; bit < 8; ++bit) {
         const unsigned shift = 7 - bit;
         const unsigned code = ((hi >> shift) & 1) * 2 + ((lo >> shift) & 1);
-        int v = 0;
-        if (_history) {
-          v = (static_cast<int>(charge[i * 8 + bit]) - _median) * 998;
-          v = v >= 0 ? v / 1024 : -((-v + 1023) / 1024);
-        }
-        v += doses[code];
-        v = v < -127 ? -127 : v > 127 ? 127 : v;
+        const int v = nextCharge(_history ? charge[i * 8 + bit] : 0, code);
         charge[i * 8 + bit] = static_cast<int8_t>(v);
         ++histogram[v + 128];
       }
