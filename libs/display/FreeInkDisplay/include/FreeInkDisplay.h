@@ -205,7 +205,8 @@ class FreeInkDisplay {
   // the base for a following grayscale pass.
   bool supportsAsyncGrayscaleBase() const;
   bool supportsTextAa() const;
-  bool tryDisplayTextAa(const uint8_t* lsb, const uint8_t* msb, size_t bytes, bool turnOffScreen = false);
+  bool tryDisplayTextAa(const uint8_t* lsb, const uint8_t* msb, size_t bytes, bool turnOffScreen = false,
+                        bool darkenGrayEdges = false);
   void releaseTextAa();
   bool supportsDeferredGrayscaleBase() const;
   // Framebuffer must remain unchanged until waitRefreshComplete().

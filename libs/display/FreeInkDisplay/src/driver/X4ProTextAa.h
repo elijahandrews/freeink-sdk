@@ -59,6 +59,21 @@ class X4ProTextAa {
     }
     return _composed = true;
   }
+  // A one-gray waveform maps both coverage masks to the same shade. For a
+  // darker text setting, represent the remapped dark gray (both masks set)
+  // with alternating gray and solid ink pixels. The caller already promoted
+  // fully covered strokes to black when it built the masks. Only 01 (gray)
+  // becomes 00 (black); white clear/hold and unmasked strokes stay intact.
+  void darkenEdges(const uint8_t* lsb, const uint8_t* msb, uint16_t widthBytes) {
+    uint8_t pattern = 0xaa;
+    for (uint32_t row = 0; row < SIZE; row += widthBytes) {
+      for (uint32_t x = 0; x < widthBytes; ++x) {
+        const uint32_t i = row + x;
+        _storage[i] &= ~(lsb[i] & msb[i] & pattern);
+      }
+      pattern ^= 0xff;
+    }
+  }
   // Commit only after the display's BUSY completion. Selector codes (hi,lo):
   // 00 black, 01 gray, 10 white hold, 11 white clear. Negative decay rounds DOWN.
   void finish() {

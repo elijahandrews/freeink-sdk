@@ -1000,12 +1000,13 @@ bool FreeInkDisplay::supportsTextAa() const {
   return !_inverted && !_inversionDirty && frameBuffer && _driver && _driver->supportsTextAa();
 }
 
-bool FreeInkDisplay::tryDisplayTextAa(const uint8_t* lsb, const uint8_t* msb, size_t bytes, bool turnOffScreen) {
+bool FreeInkDisplay::tryDisplayTextAa(const uint8_t* lsb, const uint8_t* msb, size_t bytes, bool turnOffScreen,
+                                     bool darkenGrayEdges) {
   if (!supportsTextAa() || !lsb || !msb || bytes != bufferSize || _grayscaleMode != freeink::GrayscaleMode::Overlay)
     return false;
   DisplayPmLock pmLock;
   syncPendingAsync();
-  if (!_driver->displayTextAa(_bus, frameBuffer, lsb, msb, bytes, turnOffScreen)) return false;
+  if (!_driver->displayTextAa(_bus, frameBuffer, lsb, msb, bytes, turnOffScreen, darkenGrayEdges)) return false;
 #ifndef EINK_DISPLAY_SINGLE_BUFFER_MODE
   consumePrevFrameFor(FAST_REFRESH);
   swapBuffers();

@@ -606,8 +606,9 @@ void Uc8279X4Driver::leaveTextAa(EpdBus& bus) {
 }
 
 bool Uc8279X4Driver::displayTextAa(EpdBus& bus, const uint8_t* bw, const uint8_t* lsb, const uint8_t* msb, size_t bytes,
-                                   bool turnOff) {
+                                   bool turnOff, bool darkenGrayEdges) {
   if (!supportsTextAa() || _pendingRefresh || _needFullClear || !_textAa.compose(bw, lsb, msb, bytes)) return false;
+  if (darkenGrayEdges) _textAa.darkenEdges(lsb, msb, _wb);
   bus.waitBusy("8279 text ready");
   if (bus.isBusy()) {
     _textAa.invalidate();

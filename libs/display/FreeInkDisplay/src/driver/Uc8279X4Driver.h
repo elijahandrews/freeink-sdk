@@ -88,7 +88,7 @@ class Uc8279X4Driver : public PanelDriver {
 
   bool supportsTextAa() const override;
   bool displayTextAa(EpdBus& bus, const uint8_t* bw, const uint8_t* lsb, const uint8_t* msb, size_t bytes,
-                     bool turnOff) override;
+                     bool turnOff, bool darkenGrayEdges = false) override;
   void releaseTextAa() override;
   void requestResync(uint8_t settlePasses) override;
   void skipInitialResync() override;

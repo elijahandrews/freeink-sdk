@@ -60,7 +60,7 @@ class Ssd2677Driver : public PanelDriver {
 #if FREEINK_DEVICE_PICCO
   bool supportsTextAa() const override { return true; }
   bool displayTextAa(EpdBus& bus, const uint8_t* bw, const uint8_t* lsb, const uint8_t* msb, size_t bytes,
-                     bool turnOff) override;
+                     bool turnOff, bool darkenGrayEdges = false) override;
   void releaseTextAa() override { _textAa.release(); }
 #endif
   void beginGrayscale(EpdBus& bus, const uint8_t* fb, GrayscaleMode mode, RefreshMode fallback, bool turnOff) override;

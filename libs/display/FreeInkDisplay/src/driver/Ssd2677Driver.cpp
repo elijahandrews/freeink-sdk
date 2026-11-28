@@ -401,8 +401,9 @@ void Ssd2677Driver::requestResync(uint8_t) {
 
 #if FREEINK_DEVICE_PICCO
 bool Ssd2677Driver::displayTextAa(EpdBus& bus, const uint8_t* bw, const uint8_t* lsb, const uint8_t* msb,
-                                  size_t bytes, bool /*turnOff*/) {
+                                  size_t bytes, bool /*turnOff*/, bool darkenGrayEdges) {
   if (_needsInitialFull || !_old || !ensureLsb() || !_textAa.compose(bw, lsb, msb, bytes)) return false;
+  if (darkenGrayEdges) _textAa.darkenEdges(lsb, msb, geometry().widthBytes);
   powerOn(bus);
   sendPacked(bus, _textAa.high(), _textAa.low());
   refreshWith(bus, lut_picco_se0400_text, true);
@@ -410,8 +411,9 @@ bool Ssd2677Driver::displayTextAa(EpdBus& bus, const uint8_t* bw, const uint8_t*
                                ssd2677LutDose(lut_picco_se0400_text, 3), ssd2677LutDose(lut_picco_se0400_text, 4)};
   _textAa.finish(doses, 512);
   for (size_t i = 0; i < bytes; ++i) {
-    _lsb[i] = lsb[i] | msb[i];
-    _old[i] = bw[i] | _lsb[i];  // upstream baseline treats gray as white
+    // Only selector 01 is gray. Dithered solid strokes already sit at black.
+    _lsb[i] = _textAa.low()[i] & ~_textAa.high()[i];
+    _old[i] = _textAa.high()[i] | _textAa.low()[i];
   }
   _grayPending = true;
   return true;

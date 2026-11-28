@@ -312,6 +312,36 @@ int main(int argc, char** argv) {
     assert(!s._grayPending);
     for (const auto& w : bus.writes)
       if (w.command == 0x10) assert(w.bytes[0] == 0x57);  // gray and black driven to white
+    // Source coverage, left to right: light, dark, light, dark, light, dark, black, white.
+    // The renderer maps this to different AA masks at each darkness setting.
+    const size_t stride = s.geometry().widthBytes;
+    for (unsigned level = 0; level < 3; ++level) {
+      s.releaseTextAa();  // start from a driven white instead of a held white
+      for (size_t byte : {size_t{0}, stride}) {
+        newFb[byte] = 0x01;
+        masks[byte] = level == 0 ? 0x54 : level == 1 ? 0xfc : 0xa8;
+        other[byte] = level < 2 ? 0xfc : 0xa8;
+      }
+      bus.clear();
+      assert(s.displayTextAa(bus, newFb.data(), masks.data(), other.data(), 48000, true, level != 0));
+      const uint8_t gray[2] = {static_cast<uint8_t>(level == 0 ? 0xfc : level == 1 ? 0x54 : 0),
+                               static_cast<uint8_t>(level == 0 ? 0xfc : 0xa8)};
+      unsigned transfers = 0, activations = 0;
+      for (const auto& w : bus.writes) {
+        if (w.command == 0x12) ++activations;
+        if (w.command != 0x10) continue;
+        ++transfers;
+        for (unsigned row = 0; row < 2; ++row) {
+          for (unsigned x = 0; x < 8; ++x) {
+            const uint8_t selector = (w.bytes[2 * row * stride + x / 4] >> (6 - 2 * (x % 4))) & 3;
+            const unsigned expected = x == 7 ? 3 : (gray[row] & (0x80 >> x)) ? 1 : 0;
+            assert(selector == expected);
+          }
+          assert(s._lsb[row * stride] == gray[row] && s._old[row * stride] == (gray[row] | 1));
+        }
+      }
+      assert(transfers == 1 && activations == 1);
+    }
     s.deepSleep(bus);
     assert(lastRegister(bus, 0x07) == 0xA5);
     std::printf("Picco se0400: probe, init, packing and refresh passed\n");
